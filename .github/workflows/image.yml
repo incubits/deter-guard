@@ -1,0 +1,122 @@
+# Build and publish the deter-guard image to GitHub Container Registry.
+#
+# This is the image SREs put in their pipelines, so the supply chain OF THE THING THAT GUARDS THE
+# SUPPLY CHAIN matters more than usual:
+#   * multi-arch (amd64 + arm64) so ARM runners don't fall back to emulation;
+#   * a build provenance attestation, so a customer can prove the image came from THIS repository and
+#     not from somebody's laptop — which only works if the repo is public, since verification reads
+#     it. That's the reason the guard lives here rather than inside the private console repo;
+#   * third-party actions pinned to commit SHAs.
+#
+# Tags produced:
+#   ghcr.io/<owner>/deter-guard:latest        every push to main
+#   ghcr.io/<owner>/deter-guard:sha-<sha>     every push (immutable — pin this in a pipeline)
+#   ghcr.io/<owner>/deter-guard:1.2.3, :1.2, :1   on a v1.2.3 tag
+#
+# Setup: none. GITHUB_TOKEN can publish to this repository's own package registry.
+name: Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  image:
+    name: Build and publish
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Required to attach the provenance attestation below.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      # arm64 without a native runner. Only needed for the cross build.
+      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to ghcr.io
+        # Skipped on pull requests: a fork's token can't push, and an untrusted PR must never be able
+        # to publish an image people pull into their pipelines.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/deter-guard
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=deter-guard
+            org.opencontainers.image.description=Fetch and verify an organization's signed egress policy from CI
+
+      - id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Lets a customer prove where the image came from:
+      #   gh attestation verify oci://ghcr.io/<owner>/deter-guard:1 --repo <owner>/deter-guard
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/deter-guard
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Smoke test the published image
+        if: github.event_name != 'pull_request'
+        # A tag that exists but whose entrypoint is broken is worse than a failed build — it fails in
+        # somebody else's pipeline instead of ours. Pull by DIGEST so this tests the artifact that was
+        # just pushed, not whatever `latest` happens to resolve to.
+        #
+        # Values reach the shell through env, never interpolated into the script: `${{ }}` inside
+        # `run:` is textual substitution, so it's a command-injection shape even when the specific
+        # value can't contain anything dangerous.
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/deter-guard
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker run --rm "${IMAGE}@${DIGEST}" --help
