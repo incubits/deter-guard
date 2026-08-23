@@ -4,6 +4,7 @@
   "description": "Fetch and verify your organization's signed egress policy from CI.",
   "license": "Apache-2.0",
   "type": "module",
+  "packageManager": "pnpm@11.5.2",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/incubits/deter-guard.git"
