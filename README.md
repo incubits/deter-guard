@@ -6,6 +6,33 @@ The image a CI job runs to fetch **and verify** its organization's signed egress
 ghcr.io/incubits/deter-guard
 ```
 
+A ~6 MB `scratch` image: one static binary, a CA bundle, and a passwd entry. No shell, no package
+manager, no language runtime, no dependencies — `go.mod` has no `require` block, because ed25519,
+JSON and TLS are all in the Go standard library.
+
+## What this does — and what it does not
+
+**It does not filter your traffic.** Running `deter-guard policy` and then `npm install` in the same
+job installs whatever npm wants. The guard *delivers and verifies the policy*; it is not in the
+network path.
+
+Actually controlling egress needs three things, and the guard is only the first:
+
+| | |
+| --- | --- |
+| 1. The policy, verified | **this image** |
+| 2. A proxy enforcing it | the `deter` broker, running alongside the job |
+| 3. No way around the proxy | network-level default-deny, so the proxy is the only route out |
+
+Step 3 is the one people skip. `HTTPS_PROXY` is a *request* — npm and pip honour it, but a malicious
+`postinstall` script can simply not. Without egress actually being denied at the network layer, a
+proxy is a monitoring tool, not a control.
+
+So today this image gives a pipeline the same signed policy a developer's sandbox pulls, and gets it
+there safely. Enforcing it inside CI is the next piece of work, not something you get by adding this
+step.
+
+
 On GitHub Actions it mints its own OIDC token, so **there is no secret in the pipeline to leak**.
 Elsewhere you pass an ID token or a long-lived `dtrc_` token from the console.
 
@@ -140,19 +167,28 @@ Pin `sha-<commit>` in a pipeline if you want an immutable tag.
 
 ## Not here yet
 
-Blocking malicious package versions. That needs `/api/ci/blocklist`, which the console doesn't serve
-yet. Today the guard delivers the verified egress policy; `deter-guard blocklist` slots in beside
-`policy` when there's a list to fetch.
+Two things, both flagged above:
+
+- **Enforcement inside CI.** The guard delivers the policy; nothing in this image puts it in the
+  network path. That needs the broker running alongside the job *and* egress denied at the network
+  layer — see [What this does](#what-this-does--and-what-it-does-not).
+- **Blocking malicious package versions.** Needs `/api/ci/blocklist`, which the console doesn't serve
+  yet. `deter-guard blocklist` slots in beside `policy` when there's a list to fetch.
 
 ## Building locally
 
 ```bash
-pnpm install
-pnpm test
-pnpm build           # bundles to dist/cli.js
-pnpm image           # docker build -t deter-guard:dev .
+go test ./...
+go vet ./...
+go build -o deter-guard .          # a local binary
+docker build -t deter-guard:dev .  # the scratch image
 ```
 
-The bundle is produced by `build.mjs` through esbuild's JS API rather than its `esbuild` bin: pnpm
-sometimes links that bin straight to the platform binary, which Node then tries to parse as
-JavaScript. The API has no such ambiguity, on a laptop or in Alpine.
+Go cross-compiles, so the multi-arch image needs no QEMU: the Dockerfile runs the compiler natively
+on the builder and targets each platform via `GOOS`/`GOARCH`. An arm64 image costs seconds rather
+than minutes of emulation.
+
+Nothing here depends on the console's source. The verifier is a deliberate re-implementation — a CI
+runner shouldn't pull in a web framework and a database driver to check a signature — and a test
+pins the signed-payload format against a vector produced by the console's own signer, which the
+broker's Rust verifier is also pinned against. Three implementations, one signature.

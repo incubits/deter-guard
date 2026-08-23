@@ -2,42 +2,54 @@
 #
 #   docker build -t deter-guard .
 #
-# The CLI is bundled to a single file with esbuild, so the runtime image carries no node_modules and
-# nothing but the interpreter and one script. That keeps it small — it's pulled on every pipeline run
-# — and it keeps the attack surface of a container that handles credentials small too. A guard that
-# shipped a dependency tree would be an odd thing to put in front of a supply-chain problem.
+# The runtime stage is FROM scratch. It contains three things: the static binary, a CA bundle so TLS
+# works, and a passwd entry so it can run as a non-root user. No shell, no package manager, no
+# language runtime, nothing to patch. A tool whose job is to stand in front of a supply-chain problem
+# shouldn't bring one along — and the smaller it is, the faster every pipeline run pulls it.
+#
+# The binary is CGO_ENABLED=0 static, so it needs no libc at all.
 
 # ---- build ----------------------------------------------------------------------------------
-FROM node:22-alpine AS build
-ENV PNPM_HOME=/pnpm
-ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable
-WORKDIR /app
+# --platform=$BUILDPLATFORM keeps the compiler running NATIVELY on the builder while producing a
+# binary for the target. Go cross-compiles by itself, so an arm64 image needs no QEMU emulation —
+# both much faster and one less moving part than emulating a whole toolchain.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.25-alpine AS build
+WORKDIR /src
 
-# Manifests first, so the install layer is cached until a dependency actually changes.
-# pnpm-workspace.yaml carries allowBuilds, so it has to be present for the install to run
-# esbuild postinstall.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+# No dependencies to fetch: go.mod has no `require` block. Copying it first still caches the module
+# step, and means adding a dependency invalidates that layer as it should.
+COPY go.mod ./
+RUN go mod download
 
-COPY tsconfig.base.json tsconfig.json build.mjs ./
-COPY src ./src
-RUN pnpm build
+COPY *.go ./
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+# -trimpath strips local filesystem paths, so the binary is reproducible and doesn't leak the build
+# machine's layout. -s -w drops the symbol table and DWARF, which is most of the size saving.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/deter-guard .
+
+# ---- certificates and a user ----------------------------------------------------------------
+# Both come from a real distro image rather than being hand-written, so the CA bundle is a maintained
+# one. Nothing from this stage ships except these two files.
+FROM docker.io/library/alpine:3.21 AS certs
+RUN apk add --no-cache ca-certificates
+# scratch has no /etc/passwd, so the numeric UID below would have no name. Harmless in itself, but
+# anything that looks it up complains, and one line is cheaper than explaining that later.
+RUN echo 'deter:x:65532:65532:deter:/:/sbin/nologin' > /passwd.min
 
 # ---- runtime --------------------------------------------------------------------------------
-FROM node:22-alpine AS runtime
-ENV NODE_ENV=production
+FROM scratch
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs /passwd.min /etc/passwd
+COPY --from=build /out/deter-guard /deter-guard
 
-# Non-root. The guard reads env vars, talks HTTPS, and writes the policy where it's told; it has no
-# reason to run privileged, and a CI runner is exactly where that matters.
-RUN addgroup -S deter && adduser -S -G deter deter
-
-COPY --from=build /app/dist/cli.js /usr/local/bin/deter-guard
-RUN chmod 0755 /usr/local/bin/deter-guard
-
-USER deter
+# Never root. A CI runner is exactly where that matters, and nothing in here needs it.
+USER 65532:65532
 WORKDIR /workspace
 
 # No default args: `docker run deter-guard policy` reads naturally, and a bare run prints usage
 # rather than doing something.
-ENTRYPOINT ["/usr/local/bin/deter-guard"]
+ENTRYPOINT ["/deter-guard"]

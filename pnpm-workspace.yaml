@@ -1,8 +1,0 @@
-# Not a workspace — pnpm 11 reads build permissions from this file, so a single-package repo still
-# needs it to say which postinstall scripts may run.
-#
-# esbuild ships a platform binary via a postinstall script; the bundle step and tsx both need it.
-# Everything else stays denied, which is the point of naming it explicitly: the tool that guards a
-# supply chain shouldn't run arbitrary install scripts.
-allowBuilds:
-  esbuild: true

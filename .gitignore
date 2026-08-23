@@ -1,4 +1,4 @@
-node_modules
-dist
-*.tsbuildinfo
+deter-guard
+/dist
+*.test
 .DS_Store

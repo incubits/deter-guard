@@ -1,7 +1,8 @@
-# Keep the build context small, and never bake host artifacts into the image.
-node_modules
-dist
+# Keep the build context to the source the compiler actually needs.
 .git
 .github
 *.md
+deter-guard
+dist
+*.test
 .DS_Store
