@@ -125,13 +125,18 @@ back to a `dtrc_` token — that would hide a real misconfiguration behind a dif
 
 ## Verify the image
 
-Built by GitHub Actions with a provenance attestation:
+Built by GitHub Actions with a provenance attestation, so you can prove where it came from:
 
 ```bash
-gh attestation verify oci://ghcr.io/incubits/deter-guard:1 --repo incubits/deter-console
+gh attestation verify oci://ghcr.io/incubits/deter-guard:latest --repo incubits/deter-guard
 ```
 
 Pin `sha-<commit>` in a pipeline if you want an immutable tag.
+
+> **Maintainers:** a GHCR package published by Actions starts **private**, even from a public
+> repository — it does not inherit repo visibility. Until it's switched, an anonymous
+> `docker pull` gets a `401`. Flip it once, in
+> [Packages → deter-guard → Package settings → Change visibility](https://github.com/orgs/incubits/packages/container/deter-guard/settings).
 
 ## Not here yet
 
