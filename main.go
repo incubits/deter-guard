@@ -44,6 +44,11 @@ func errf(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "deter-guard: "+format+"\n", a...)
 }
 
+// logf writes progress to stderr, so stdout stays clean for a policy or JSON the caller is piping.
+func logf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "deter-guard: "+format+"\n", a...)
+}
+
 type opts struct {
 	consoleURL string
 	audience   string
@@ -52,6 +57,10 @@ type opts struct {
 	project    string
 	run        string
 	asJSON     bool
+	// exec only
+	policyFile string
+	stateDir   string
+	verbose    bool
 }
 
 const usage = `deter-guard — fetch this organization's signed egress policy in CI
@@ -59,6 +68,7 @@ const usage = `deter-guard — fetch this organization's signed egress policy in
 Usage:
   deter-guard whoami [options]
   deter-guard policy [options]
+  deter-guard exec   [options] -- <command...>
 
 Options:
   --console <url>    Console base URL             (env DETER_CONSOLE_URL)
@@ -68,6 +78,11 @@ Options:
   --project <ref>    Project id for a dtrc_ token (env DETER_PROJECT)
   --run <ref>        Run id, deduplicates usage   (env DETER_RUN_ID)
   --json             Machine-readable output
+
+exec options:
+  --policy <path>    Use a local policy file instead of the console (UNSIGNED)
+  --state-dir <dir>  Where to write the CA the build must trust (default: temp dir)
+  --verbose          Log allowed requests too, not just refusals
   --version          Print the version
   -h, --help         This
 
@@ -131,7 +146,7 @@ func run() int {
 		fmt.Println(version)
 		return exitOK
 	}
-	if cmd != "whoami" && cmd != "policy" {
+	if cmd != "whoami" && cmd != "policy" && cmd != "exec" {
 		errf("unknown command %q", cmd)
 		fmt.Println(usage)
 		return exitUsage
@@ -148,9 +163,16 @@ func run() int {
 	fs.StringVar(&o.project, "project", env("DETER_PROJECT", ""), "")
 	fs.StringVar(&o.run, "run", env("DETER_RUN_ID", ""), "")
 	fs.BoolVar(&o.asJSON, "json", false, "")
+	fs.StringVar(&o.policyFile, "policy", env("DETER_POLICY_FILE", ""), "")
+	fs.StringVar(&o.stateDir, "state-dir", env("DETER_STATE_DIR", ""), "")
+	fs.BoolVar(&o.verbose, "verbose", false, "")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return exitUsage
 	}
+	if cmd == "exec" {
+		return runExecCommand(o, fs.Args())
+	}
+
 	if o.consoleURL == "" {
 		errf("no console URL — pass --console or set DETER_CONSOLE_URL")
 		return exitUsage

@@ -1,6 +1,7 @@
 # deter-guard
 
-The image a CI job runs to fetch **and verify** its organization's signed egress policy.
+Egress control for a CI job: fetch and verify the organization's signed policy, then **run the build
+behind a filtering proxy** so a blocklisted package is never downloaded.
 
 ```
 ghcr.io/incubits/deter-guard
@@ -10,36 +11,61 @@ A ~6 MB `scratch` image: one static binary, a CA bundle, and a passwd entry. No 
 manager, no language runtime, no dependencies — `go.mod` has no `require` block, because ed25519,
 JSON and TLS are all in the Go standard library.
 
-## What this does — and what it does not
+## What this does
 
-**It does not filter your traffic.** Running `deter-guard policy` and then `npm install` in the same
-job installs whatever npm wants. The guard *delivers and verifies the policy*; it is not in the
-network path.
+`deter-guard exec` starts a local proxy, points the build at it, and decides every request:
 
-Actually controlling egress needs three things, and the guard is only the first:
+```
+deter-guard exec -- npm ci
+```
 
-| | |
+```
+deter-guard: policy version 812 verified against pinned key a092bf20…1b26d0f8
+deter-guard: egress proxy on http://127.0.0.1:52054 · 4 rule(s), 118 block(s)
+deter-guard: DENY  GET registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz — on your blocklist
+npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz
+```
+
+Two decision points, and the split matters:
+
+| | Decided on |
 | --- | --- |
-| 1. The policy, verified | **this image** |
-| 2. A proxy enforcing it | the `deter` broker, running alongside the job |
-| 3. No way around the proxy | network-level default-deny, so the proxy is the only route out |
+| `CONNECT host:443` | host — a tunnel has no method or path yet |
+| every request inside it | host + method + **path**, after TLS is terminated |
 
-Step 3 is the one people skip. `HTTPS_PROXY` is a *request* — npm and pip honour it, but a malicious
-`postinstall` script can simply not. Without egress actually being denied at the network layer, a
-proxy is a monitoring tool, not a control.
+Deciding only at the tunnel is what makes path rules unenforceable: a rule scoped to `/v1/*` has
+nothing to match at CONNECT time, so either the whole host gets refused or the rule does nothing.
+Both are wrong and both are silent. So the tunnel opens if the host is plausibly reachable, and each
+request inside it is checked properly.
 
-So today this image gives a pipeline the same signed policy a developer's sandbox pulls, and gets it
-there safely. Enforcing it inside CI is the next piece of work, not something you get by adding this
-step.
+**This is why a blocklist can name a package version.** `registry.npmjs.org` stays reachable while
+one compromised tarball does not — which needs the path, which needs TLS interception. A CA is
+generated in memory per run, written only where the build is told to trust it, and dies with the job.
 
+### What it does not do
 
-On GitHub Actions it mints its own OIDC token, so **there is no secret in the pipeline to leak**.
-Elsewhere you pass an ID token or a long-lived `dtrc_` token from the console.
+**It cannot filter what refuses to use it.** `HTTPS_PROXY` is a request. npm, pip, curl and git all
+honour it — but a malicious `postinstall` can simply not.
 
-This is the CI-side client for [deter](https://github.com/incubits/deter)'s control plane. It's a
-separate repository from the console on purpose: the guard is the part that runs inside *your*
-pipeline, so it should be auditable, and a build provenance attestation is only worth having if you
-can verify it against a repository you can read.
+That matters less than it sounds, because the proxy sits where packages are **fetched**: a blocked
+package is never downloaded, so its install script never runs. The gap is the second case only —
+code already executing that ignores the proxy. Closing it needs default-deny egress, which the
+container can enforce on itself:
+
+An entrypoint holding `CAP_NET_ADMIN` can put the job's own network namespace in default-deny and
+then **drop privileges before running the build**. The build inherits the namespace, so the rules
+apply to it, but not the capability, so it cannot remove them. Two things decide whether that holds:
+
+- **The capability must be granted from outside** — `--cap-add=NET_ADMIN`, or
+  `securityContext.capabilities`. Nothing inside an image grants it to itself. On GitHub Actions it
+  goes in `container.options`, which allows it — unlike `--network`, one of the two options Actions
+  forbids.
+- **The build must not keep it.** A build running as root with `CAP_NET_ADMIN` just flushes the rules
+  and walks out. The privilege drop *is* the control.
+
+`deter-guard` does not install those rules yet. Until it does, treat `exec` as strong filtering of
+cooperative tools — which is the whole acquisition half of a supply-chain attack — and not as a
+sandbox.
 
 ## Quick start
 
@@ -118,9 +144,31 @@ It's a public key: commit it, put it in a CI variable, print it in logs. That's 
 | | |
 | --- | --- |
 | `deter-guard whoami` | What this pipeline authenticates as. Run it first when something's wrong. |
-| `deter-guard policy` | Fetch, verify, and write the policy. `--out <path>`, or stdout. |
+| `deter-guard policy` | Fetch, verify, and write the Cedar policy. `--out <path>`, or stdout. |
+| `deter-guard exec -- <cmd>` | Run `<cmd>` behind the filtering proxy. The command's exit code is passed straight through. |
 
-`--json` on either for machine-readable output.
+`--json` on `whoami`/`policy` for machine-readable output.
+
+### exec options
+
+| | |
+| --- | --- |
+| `--policy <path>` | Enforce a local policy file instead of fetching one. **Unsigned** — nothing is verified, so it says so on every run. For testing and air-gapped runners. |
+| `--state-dir <dir>` | Where the CA the build must trust is written. Defaults to a temp dir. |
+| `--verbose` | Log allowed requests too, not just refusals. |
+
+`exec` needs the build tooling in the same container, so the usual shape is to copy the binary into
+your own image rather than run this one:
+
+```dockerfile
+FROM node:22-alpine
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+```
+
+The proxy is configured for the child through the environment — `HTTPS_PROXY` and friends, plus
+`NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
+`SSL_CERT_FILE` and `CARGO_HTTP_CAINFO`. Missing one of those shows up as an inscrutable certificate
+error deep inside a package manager, so they are all set.
 
 ## Exit codes
 
@@ -167,13 +215,12 @@ Pin `sha-<commit>` in a pipeline if you want an immutable tag.
 
 ## Not here yet
 
-Two things, both flagged above:
-
-- **Enforcement inside CI.** The guard delivers the policy; nothing in this image puts it in the
-  network path. That needs the broker running alongside the job *and* egress denied at the network
-  layer — see [What this does](#what-this-does--and-what-it-does-not).
-- **Blocking malicious package versions.** Needs `/api/ci/blocklist`, which the console doesn't serve
-  yet. `deter-guard blocklist` slots in beside `policy` when there's a list to fetch.
+- **Default-deny egress.** `exec` filters what is sent through the proxy; it does not yet stop a
+  process from ignoring it. See [What it does not do](#what-it-does-not-do) — the mechanism is known,
+  it just is not wired up.
+- **A blocklist feed.** The client already understands and enforces `blocked` entries, and the
+  console already serves the field — but nothing populates it yet. Once a feed lands, every job
+  picks it up on its next run with no change here.
 
 ## Building locally
 
