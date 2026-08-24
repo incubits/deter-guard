@@ -72,6 +72,14 @@ type opts struct {
 	readyFile string
 	detach    bool
 	wrap      bool
+	// serve --transparent only
+	transparent bool
+	redirect    bool
+	installCA   bool
+	noCIHosts   bool
+	tHTTPPort   int
+	tTLSPort    int
+	exempt      string
 	// env only
 	format   string
 	proxyURL string
@@ -109,6 +117,17 @@ serve options:
   --ready-file <p>   Write the proxy URL here once it is actually listening
   --detach           Background the proxy and return once it is up
   --wrap             Run one command on a FIXED port, then shut down
+
+transparent mode (Linux, needs root — nothing has to opt in, and nothing can opt out):
+  --transparent      Filter redirected traffic. No proxy variables are involved at all
+  --redirect         Install the iptables rules that send outbound :80/:443 here
+  --install-ca       Trust the guard's CA system-wide, so intercepted TLS verifies
+  --no-ci-hosts      Also enforce the policy against this runner's OWN control plane
+                     (default: those hosts are permitted, so a bad policy cannot stop
+                      the job reporting that it was a bad policy)
+  --exempt <cidrs>   Comma-separated CIDRs never to intercept
+  --transparent-http-port <n>   default 3129
+  --transparent-tls-port  <n>   default 3130
 
 env options:
   --format <fmt>     sh (default), github, docker, json
@@ -229,6 +248,13 @@ func run() int {
 	fs.StringVar(&o.readyFile, "ready-file", "", "")
 	fs.BoolVar(&o.detach, "detach", false, "")
 	fs.BoolVar(&o.wrap, "wrap", false, "")
+	fs.BoolVar(&o.transparent, "transparent", false, "")
+	fs.BoolVar(&o.redirect, "redirect", false, "")
+	fs.BoolVar(&o.installCA, "install-ca", false, "")
+	fs.BoolVar(&o.noCIHosts, "no-ci-hosts", false, "")
+	fs.IntVar(&o.tHTTPPort, "transparent-http-port", defaultTransparentHTTPPort, "")
+	fs.IntVar(&o.tTLSPort, "transparent-tls-port", defaultTransparentTLSPort, "")
+	fs.StringVar(&o.exempt, "exempt", "", "")
 	fs.StringVar(&o.format, "format", "sh", "")
 	fs.StringVar(&o.proxyURL, "proxy", "", "")
 	fs.StringVar(&o.caPath, "ca", "", "")

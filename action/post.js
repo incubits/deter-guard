@@ -15,6 +15,7 @@
 
 'use strict'
 
+const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -43,16 +44,30 @@ function stopGuard() {
 
   try {
     process.kill(pid, 'SIGTERM')
-  } catch {
-    return // already gone
+  } catch (err) {
+    if (err.code === 'ESRCH') return // already gone
+    // EPERM means the guard is running as root, which is transparent mode: it needed privileges to
+    // write firewall rules and the system trust store. We are not root, so ask sudo. Without this
+    // the guard is never signalled, so it never flushes its report AND never removes the firewall
+    // rules or the CA it installed — the job would end with both still in place.
+    const sudo = spawnSync('sudo', ['-n', 'kill', '-TERM', String(pid)], { stdio: 'inherit' })
+    if (sudo.status !== 0) {
+      log('::warning title=deter-guard::could not signal the guard (pid ' + pid + '). Its refusal ' +
+          'report was not flushed, and any firewall rules it installed may still be in place.')
+      return
+    }
   }
 
   // The guard caps its own flush at 20s; wait a little past that rather than racing it.
+  //
+  // ESRCH means gone. EPERM means very much still there — a root-owned process we may not signal —
+  // so it must NOT be read as "exited", or transparent mode would return here instantly and let the
+  // job end while the guard was still flushing.
   for (let i = 0; i < 25; i++) {
     try {
       process.kill(pid, 0)
-    } catch {
-      return // exited cleanly, report flushed
+    } catch (err) {
+      if (err.code === 'ESRCH') return // exited cleanly, report flushed
     }
     sleep(1000)
   }

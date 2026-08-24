@@ -61,6 +61,15 @@ inputs:
       your own numbers. Defaults to the workflow run id.
     required: false
     default: ""
+  transparent:
+    description: >-
+      Intercept the job's traffic at the kernel instead of pointing it here with environment
+      variables. Nothing has to opt in and nothing can opt out — a package's install script that
+      opens its own socket is filtered too. Needs sudo, which GitHub-hosted runners provide.
+      This runner's own control-plane hosts are permitted automatically, so a policy that forgets
+      them fails the build rather than stopping the runner reporting it.
+    required: false
+    default: "false"
   verbose:
     description: Log allowed requests too, not just refusals.
     required: false

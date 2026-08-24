@@ -100,16 +100,36 @@ function main() {
   if (policyFile) args.push('--policy', policyFile)
   if (bool('verbose')) args.push('--verbose')
 
+  // Transparent mode needs to write firewall rules and the system trust store, so it runs under
+  // sudo. Hosted runners give passwordless sudo; a self-hosted one may not, which is why this is
+  // opt-in rather than the default.
+  const transparent = bool('transparent')
+  if (transparent) args.push('--transparent', '--redirect', '--install-ca')
+  const cmd = transparent ? 'sudo' : guard
+  const argv = transparent
+    // sudo drops the environment by default, and the guard needs DETER_* to reach the console.
+    ? ['--preserve-env=DETER_CONSOLE_URL,DETER_POLICY_PUBKEY,DETER_PROJECT,DETER_RUN_ID,DETER_STATE_DIR,ACTIONS_ID_TOKEN_REQUEST_URL,ACTIONS_ID_TOKEN_REQUEST_TOKEN,GITHUB_ACTIONS',
+       guard, ...args]
+    : args
+
   log('::group::deter-guard: starting')
-  const started = spawnSync(guard, args, { encoding: 'utf8', stdio: ['ignore', 'inherit', 'inherit'], env })
+  const started = spawnSync(cmd, argv, { encoding: 'utf8', stdio: ['ignore', 'inherit', 'inherit'], env })
   log('::endgroup::')
   if (started.status !== 0) {
     fail('the guard did not start; see the log above')
   }
 
-  // Everything the build needs to find the proxy, straight from the guard rather than from a list
-  // maintained here. A copy of that list in this file would stop matching the guard's the next time
-  // a variable is added, and the symptom would be one ecosystem quietly bypassing the proxy.
+  // Exported even in transparent mode, and not redundantly.
+  //
+  // Node does NOT use the system trust store — it ships its own roots — so `--install-ca` covers
+  // curl, git, python and the rest but leaves every Node tool rejecting the intercepted certificate.
+  // NODE_EXTRA_CA_CERTS is what covers it. The proxy variables are belt-and-braces on top: a
+  // cooperative tool takes the forward proxy (loopback, exempt from the redirect), an uncooperative
+  // one gets intercepted, and both are decided by the same policy.
+  //
+  // Straight from the guard rather than from a list maintained here. A copy of that list in this
+  // file would stop matching the guard's the next time a variable is added, and the symptom would be
+  // one ecosystem quietly bypassing the proxy.
   let exported
   try {
     exported = run(guard, ['env', '--state-dir', stateDir, '--format', 'github'])

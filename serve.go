@@ -56,6 +56,39 @@ const detachedEnv = "DETER_GUARD_DETACHED"
 // stateFileName holds where the proxy is listening, so `deter-guard env` needs no arguments.
 const stateFileName = "deter-guard.json"
 
+// Ports the kernel redirects outbound 80 and 443 to in transparent mode. Two, because what arrives
+// on 443 is a TLS record and what arrives on 80 is a request line.
+const (
+	defaultTransparentHTTPPort = 3129
+	defaultTransparentTLSPort  = 3130
+)
+
+// ciControlPlaneHosts are permitted automatically in transparent mode.
+//
+// This is a deliberate hole in default-deny, and it buys the difference between a mistake you can
+// read and one you cannot. Transparent mode intercepts EVERYTHING, including the CI runner's own
+// traffic back to its control plane. A policy that does not list those hosts would not merely fail
+// the build — it would stop the runner uploading logs, reporting status, or saying why. The job
+// would die mute, and the guard would look like an outage rather than a policy.
+//
+// These are the runner's own channel, not the build's dependencies. They are logged at startup, so
+// nobody has to read source to find out what was permitted on their behalf, and --no-ci-hosts turns
+// them off for anyone who would rather have the failure.
+func ciControlPlaneHosts() []string {
+	if os.Getenv("GITHUB_ACTIONS") == "true" {
+		return []string{
+			"github.com",
+			"api.github.com",
+			"*.actions.githubusercontent.com",
+			"objects.githubusercontent.com",
+			"*.blob.core.windows.net", // where Actions puts logs and artifacts
+			"ghcr.io",
+			"pkg-containers.githubusercontent.com",
+		}
+	}
+	return nil
+}
+
 // guardState is what serve publishes and env reads back.
 type guardState struct {
 	ProxyURL string `json:"proxy_url"`
@@ -73,11 +106,16 @@ type guardServer struct {
 	proxyURL string
 	caPath   string
 	ca       *certAuthority
+	px       *proxy
 	srv      *http.Server
 	reporter *reporter
 	// removeCA is false when the operator named the path with --ca-out: a file they asked for is
 	// theirs, and deleting it would break a container that mounted it.
 	removeCA bool
+	// cleanup is run in REVERSE on stop. Transparent mode installs a system CA and firewall rules,
+	// and the order they come out in is not the order they went in: the redirect has to go before
+	// the trust it depends on, or a build gets intercepted by a proxy it has stopped trusting.
+	cleanup []func()
 }
 
 // startGuard generates a CA, writes it where the build can read it, and starts the proxy.
@@ -129,6 +167,7 @@ func startGuard(pol *Policy, rep *reporter, addr string, port int, caPath string
 		proxyURL: "http://" + net.JoinHostPort(addr, fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)),
 		caPath:   caPath,
 		ca:       ca,
+		px:       px,
 		srv:      srv,
 		reporter: rep,
 		removeCA: removeCA,
@@ -143,6 +182,12 @@ func startGuard(pol *Policy, rep *reporter, addr string, port int, caPath string
 // Order matters and is the reason this is not inlined at both call sites: stop accepting first so
 // nothing new is recorded, then flush. A flush that raced new refusals would report a moving target.
 func (g *guardServer) stop() {
+	// Reverse order: whatever was installed last is removed first. In transparent mode that means
+	// the firewall rules come out before the CA they made necessary — the other way round leaves a
+	// window where traffic is still being intercepted by a proxy nothing trusts any more.
+	for i := len(g.cleanup) - 1; i >= 0; i-- {
+		g.cleanup[i]()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = g.srv.Shutdown(ctx)
 	cancel()
@@ -150,6 +195,81 @@ func (g *guardServer) stop() {
 	if g.removeCA {
 		os.Remove(g.caPath)
 	}
+}
+
+// goTransparent puts the guard in front of traffic that was never told about it.
+//
+// Three things, and the order they are done in is the whole of the care required:
+//
+//  1. permit the CI control plane, so a mistake in steps 2 and 3 can still be reported;
+//  2. install the CA, so intercepted TLS is trusted BEFORE anything is intercepted;
+//  3. install the redirect, which is the step that actually starts intercepting.
+//
+// Reversed on the way out by g.cleanup.
+func (g *guardServer) goTransparent(o opts, pol *Policy) error {
+	if !transparentSupported() {
+		return errNotLinux
+	}
+
+	if !o.noCIHosts {
+		if hosts := ciControlPlaneHosts(); len(hosts) > 0 {
+			for _, h := range hosts {
+				pol.Rules = append(pol.Rules, Rule{Host: h, PathPrefixes: []string{"/"}})
+			}
+			logf("transparent mode also permits this runner's own control plane, so a policy "+
+				"mistake cannot stop the job reporting one: %s", strings.Join(hosts, ", "))
+			logf("(pass --no-ci-hosts to enforce the policy against those too)")
+		}
+	}
+
+	httpPort, tlsPort := o.tHTTPPort, o.tTLSPort
+	// REDIRECT rewrites the destination of locally generated packets to loopback, so that is where
+	// the listeners belong. Binding wider would publish an intercepting proxy to the network.
+	httpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
+	if err != nil {
+		return fmt.Errorf("opening the transparent http port: %w", err)
+	}
+	tlsLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tlsPort))
+	if err != nil {
+		httpLn.Close()
+		return fmt.Errorf("opening the transparent tls port: %w", err)
+	}
+	stopListeners := g.px.serveTransparent(tlsLn, httpLn)
+	g.cleanup = append(g.cleanup, stopListeners)
+
+	if o.installCA {
+		undo, err := installSystemCA(g.ca.caPEM())
+		if err != nil {
+			return fmt.Errorf("installing the CA into the system trust store: %w", err)
+		}
+		g.cleanup = append(g.cleanup, undo)
+	} else {
+		logf("WARNING: --transparent without --install-ca. Anything that does not already trust %s "+
+			"will fail its handshake rather than be filtered.", g.caPath)
+	}
+
+	if o.redirect {
+		// Before installing the rules, not after: an unmarked upstream connection made in the
+		// window between would be redirected into the guard itself.
+		enableSocketMarking(g.px.upstream)
+		var exempt []string
+		if o.exempt != "" {
+			exempt = strings.Split(o.exempt, ",")
+		}
+		if err := installRedirect(httpPort, tlsPort, exempt); err != nil {
+			return fmt.Errorf("installing the redirect: %w", err)
+		}
+		g.cleanup = append(g.cleanup, func() {
+			if err := removeRedirect(); err != nil {
+				errf("could NOT remove the firewall rules — remove them by hand: %s", err)
+			}
+		})
+	} else {
+		logf("transparent listeners are up on :%d and :%d, but nothing is redirected to them. "+
+			"Pass --redirect, or install the rules yourself.", httpPort, tlsPort)
+	}
+
+	return nil
 }
 
 func isLoopback(addr string) bool {
@@ -230,6 +350,16 @@ func runServeCommand(o opts, argv []string) int {
 	if err != nil {
 		errf("%s", err)
 		return exitUsage
+	}
+
+	if o.transparent {
+		if err := g.goTransparent(o, pol); err != nil {
+			// Everything installed so far comes back out. A half-configured interception is worse
+			// than none: it is the state where traffic is redirected and nothing is filtering it.
+			g.stop()
+			errf("%s", err)
+			return exitUsage
+		}
 	}
 
 	statePath, err := writeState(stateDir, guardState{
