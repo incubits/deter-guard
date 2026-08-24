@@ -47,6 +47,14 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+      # The action is JavaScript, so `go test` never touched it — and the first thing it shipped
+      # with was a bug that silently skipped attestation verification while still going green.
+      # Node's built-in runner, no dependencies, same rule as the action itself.
+      #
+      # Named explicitly rather than `--test action/`, because the runner would otherwise execute
+      # main.js, which is a program and not a test.
+      - run: node --test action/inputs.test.js
+
   image:
     name: Build and publish
     needs: test

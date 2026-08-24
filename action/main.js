@@ -13,13 +13,11 @@ const path = require('node:path')
 
 const GUARD_REPO = 'incubits/deter-guard'
 
-function input(name) {
-  return (process.env[`INPUT_${name.toUpperCase().replace(/[ -]/g, '_')}`] || '').trim()
-}
+// See inputs.js for why these are a separate, tested module rather than two lines inlined here.
+const inputs = require('./inputs.js')
 
-function bool(name) {
-  return /^(true|1|yes)$/i.test(input(name))
-}
+const input = (name) => inputs.input(process.env, name)
+const bool = (name) => inputs.bool(process.env, name)
 
 function log(msg) {
   process.stdout.write(`${msg}\n`)
