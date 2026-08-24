@@ -71,6 +71,9 @@ sandbox.
 
 ### GitHub Actions
 
+One step. Everything after it is guarded — no prefix on your commands, no environment to wire up,
+no teardown to remember:
+
 ```yaml
 jobs:
   build:
@@ -78,17 +81,45 @@ jobs:
     permissions:
       contents: read
       id-token: write # required — without it GitHub won't mint an OIDC token
-    container:
-      image: ghcr.io/incubits/deter-guard:1
+      packages: read
     steps:
-      - run: deter-guard policy --out egress.cedar
-        env:
-          DETER_CONSOLE_URL: https://console.example.com
-          DETER_POLICY_PUBKEY: ${{ vars.DETER_POLICY_PUBKEY }}
+      - uses: actions/checkout@v5
+      - uses: incubits/deter-guard@v1
+        with:
+          console: ${{ vars.DETER_CONSOLE_URL }}
+          pubkey: ${{ vars.DETER_POLICY_PUBKEY }}
+
+      - run: pnpm install --frozen-lockfile   # guarded
+      - run: pnpm build                       # guarded
 ```
+
+The action pulls the guard, verifies its build provenance, starts it, and puts it in front of every
+later step. At the end of the job — pass, fail or cancel — it stops the guard so the refusal report
+is flushed, prints the guard's log, and turns each refused host into an annotation on the run summary.
+
+That last part is why this is a step and not a snippet to copy. The report flushes on `SIGTERM`, so a
+guard the runner simply reaps enforces perfectly and reports **nothing**; you would keep the
+enforcement and silently lose the audit trail, and the build result would look identical either way.
 
 Claim your GitHub organization first, under **CI protection → Trusted CI owners**. Without that the
 exchange is refused — that's the point: a credential from an org you haven't claimed can't be used.
+
+<details>
+<summary>Doing it by hand instead</summary>
+
+```yaml
+      - run: |
+          deter-guard serve --detach --state-dir "$RUNNER_TEMP/deter"
+          deter-guard env --state-dir "$RUNNER_TEMP/deter" --format github >> "$GITHUB_ENV"
+        env:
+          DETER_CONSOLE_URL: ${{ vars.DETER_CONSOLE_URL }}
+          DETER_POLICY_PUBKEY: ${{ vars.DETER_POLICY_PUBKEY }}
+```
+
+If you do this, add a `if: always()` step that SIGTERMs the guard, or you lose the report. And set
+`NODE_USE_ENV_PROXY=1`, or corepack's own download of your package manager goes around the proxy.
+The action does both for you.
+</details>
 
 ### GitLab CI
 
@@ -96,7 +127,7 @@ GitLab requires the job to *declare* its ID token, so hand it over as `DETER_ID_
 
 ```yaml
 policy:
-  image: ghcr.io/incubits/deter-guard:1
+  image: ghcr.io/incubits/deter-guard:latest
   id_tokens:
     DETER_ID_TOKEN: { aud: "deter-console" }
   variables:
@@ -115,7 +146,7 @@ docker run --rm \
   -e DETER_CI_TOKEN="$DETER_CI_TOKEN" \
   -e DETER_POLICY_PUBKEY="$DETER_POLICY_PUBKEY" \
   -v "$PWD:/workspace" \
-  ghcr.io/incubits/deter-guard:1 \
+  ghcr.io/incubits/deter-guard:latest \
   policy --project "$JOB_NAME" --run "$BUILD_TAG" --out /workspace/egress.cedar
 ```
 
