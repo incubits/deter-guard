@@ -146,10 +146,12 @@ It's a public key: commit it, put it in a CI variable, print it in logs. That's 
 | `deter-guard whoami` | What this pipeline authenticates as. Run it first when something's wrong. |
 | `deter-guard policy` | Fetch, verify, and write the Cedar policy. `--out <path>`, or stdout. |
 | `deter-guard exec -- <cmd>` | Run `<cmd>` behind the filtering proxy. The command's exit code is passed straight through. |
+| `deter-guard serve` | Run the proxy as a process in its own right, so many commands can sit behind one proxy. |
+| `deter-guard env` | Print the variables that point a build at a running proxy. |
 
 `--json` on `whoami`/`policy` for machine-readable output.
 
-### exec options
+### exec and serve options
 
 | | |
 | --- | --- |
@@ -157,18 +159,127 @@ It's a public key: commit it, put it in a CI variable, print it in logs. That's 
 | `--state-dir <dir>` | Where the CA the build must trust is written. Defaults to a temp dir. |
 | `--verbose` | Log allowed requests too, not just refusals. |
 
-`exec` needs the build tooling in the same container, so the usual shape is to copy the binary into
-your own image rather than run this one:
+### serve options
+
+| | |
+| --- | --- |
+| `--addr <ip>` | Listen address. Default `127.0.0.1`. Anything else is warned about loudly — see below. |
+| `--port <n>` | Listen port. Default `3128`; `0` lets the kernel pick a free one. |
+| `--ca-out <path>` | Write the CA here, and leave it there on exit. |
+| `--ready-file <p>` | Write the proxy URL here once the socket is actually accepting. |
+| `--detach` | Background the proxy; return only once it is up. |
+| `--wrap` | Run one command on a fixed port, then shut down. |
+
+### env options
+
+| | |
+| --- | --- |
+| `--format <fmt>` | `sh` (default), `github`, `docker`, `json`. |
+| `--proxy <url>`, `--ca <path>` | Override. By default both are read from the running guard's state file. |
+| `--unset` | Emit lines that *clear* the variables instead of setting them. |
+
+The proxy is configured for the build through the environment — `HTTPS_PROXY` and friends, plus
+`NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
+`SSL_CERT_FILE` and `CARGO_HTTP_CAINFO`. Missing one of those shows up as an inscrutable certificate
+error deep inside a package manager, so they are all set. `deter-guard env` prints exactly that list,
+which is why it exists: a list copied into your repository stops matching ours the next time it grows.
+
+## Adding the guard to an image you already build
+
+One `COPY`. The binary is static and carries its own root certificates, so it does not need a CA
+bundle, a libc, or anything else from the image it lands in:
 
 ```dockerfile
-FROM node:22-alpine
 COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 ```
 
-The proxy is configured for the child through the environment — `HTTPS_PROXY` and friends, plus
-`NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
-`SSL_CERT_FILE` and `CARGO_HTTP_CAINFO`. Missing one of those shows up as an inscrutable certificate
-error deep inside a package manager, so they are all set.
+There are three ways to put it in front of a build. They differ in how hard it is for the build to
+get around, so pick by what you are defending against.
+
+### 1. Wrap each command — `exec`
+
+```dockerfile
+FROM node:22-slim
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+RUN deter-guard exec -- npm ci
+```
+
+Simplest, and scoped to exactly the command you name. The cost is a prefix on every line.
+
+### 2. One proxy, many commands — `serve`
+
+For a developer image where people run whatever they like and you still want the traffic filtered,
+put the guard at PID 1 and let everything inherit it:
+
+```dockerfile
+FROM node:22-slim
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+
+# A FIXED port and CA path, so these values can be baked in — which is what makes
+# `docker exec` into a running container covered too, not just the CMD.
+ENV DETER_GUARD_PORT=3128 DETER_GUARD_CA_OUT=/etc/deter/ca.pem
+ENV HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128 \
+    http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 \
+    NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 \
+    NODE_EXTRA_CA_CERTS=/etc/deter/ca.pem SSL_CERT_FILE=/etc/deter/ca.pem \
+    REQUESTS_CA_BUNDLE=/etc/deter/ca.pem PIP_CERT=/etc/deter/ca.pem \
+    CURL_CA_BUNDLE=/etc/deter/ca.pem GIT_SSL_CAINFO=/etc/deter/ca.pem \
+    CARGO_HTTP_CAINFO=/etc/deter/ca.pem DETER_GUARD_CA=/etc/deter/ca.pem
+
+ENTRYPOINT ["deter-guard", "serve", "--wrap", "--"]
+CMD ["bash"]
+```
+
+`deter-guard env --format docker` prints that `ENV` block, so you do not have to keep it in step by
+hand.
+
+In CI, the same idea without a container — start it once, then every later step is guarded with no
+prefix:
+
+```yaml
+- run: deter-guard serve --detach
+- run: deter-guard env --format github >> "$GITHUB_ENV"
+- run: pnpm install --frozen-lockfile
+- run: pnpm build
+- run: pkill -TERM deter-guard || true   # lets it flush its report
+  if: always()
+```
+
+Shut it down rather than letting the job reap it: refusals are flushed on `SIGTERM`, so a guard that
+is killed outright enforces correctly and tells the console nothing.
+
+### 3. A sidecar that owns the network — strongest
+
+Run the guard in its own container and give the build container no route out except through it
+(`network_mode: service:guard` in Compose, or one Pod with two containers). The build cannot stop the
+proxy, cannot rewrite its rules, and cannot un-set its way around it, because none of it is in its
+container.
+
+```yaml
+services:
+  guard:
+    image: ghcr.io/incubits/deter-guard:latest
+    command: ["serve", "--addr", "0.0.0.0", "--port", "3128", "--ca-out", "/shared/ca.pem"]
+    volumes: ["shared:/shared"]
+  build:
+    image: your-build-image
+    network_mode: "service:guard"
+    volumes: ["shared:/shared"]
+```
+
+`--addr 0.0.0.0` publishes an intercepting proxy with no authentication on it, so the guard warns
+every time you do it. Publish it to one build's network, never to a shared one.
+
+### How much any of this is worth
+
+Shapes 1 and 2 point the build at the proxy with environment variables, and a variable is a
+*request*: a package's install script that opens its own socket, ignoring `HTTPS_PROXY`, is not
+stopped by either. That is still the control that matters for the main threat, because it sits where
+packages are **fetched** — a package that is never downloaded never runs its install script.
+
+Shape 3 is the one that holds against a process actively trying to get out, and only if the build
+container genuinely has no other route. Do not describe shapes 1 and 2 to your auditors as
+containment.
 
 ## Exit codes
 
@@ -192,8 +303,22 @@ Distinct on purpose — a pipeline shouldn't have to grep stderr to know what ha
 | `DETER_CI_OIDC_AUDIENCE` | `--audience` | Default `deter-console`. Must match the console. |
 | `DETER_PROJECT` | `--project` | Project id, for a `dtrc_` token. |
 | `DETER_RUN_ID` | `--run` | Run id — deduplicates usage across retries. |
+| `DETER_POLICY_FILE` | `--policy` | Enforce a local, **unsigned** policy file. |
+| `DETER_STATE_DIR` | `--state-dir` | Where the CA and the state file go. |
+| `DETER_GUARD_ADDR` | `--addr` | `serve` listen address. Default `127.0.0.1`. |
+| `DETER_GUARD_PORT` | `--port` | `serve` listen port. Default `3128`. |
+| `DETER_GUARD_CA_OUT` | `--ca-out` | Where `serve` writes the CA, and leaves it. |
+| `DETER_GUARD_ROOTS` | | Roots for the guard's *own* TLS: `both` (default), `system`, `embedded`. |
 
 Credentials are tried in order: `DETER_ID_TOKEN`, then GitHub Actions OIDC, then `DETER_CI_TOKEN`.
+
+`DETER_GUARD_ROOTS` deserves a note. The binary embeds Mozilla's root set so that copying it into a
+slim image — one that carries no CA bundle, because its language runtime ships its own — does not
+silently break the guard's own outbound TLS. By default those roots are a **union** with the host's
+store, which means a root the host has deliberately distrusted stays trusted here until the guard is
+rebuilt. Set `system` to use only the host's trust decisions and fail honestly when there are none,
+or `embedded` for a set that does not vary with the base image. None of this affects what the *build*
+may reach: that is the policy, checked before any connection is made.
 
 If the OIDC exchange is *rejected* (wrong audience, owner not claimed) the guard does **not** fall
 back to a `dtrc_` token — that would hide a real misconfiguration behind a different credential.
@@ -215,9 +340,12 @@ Pin `sha-<commit>` in a pipeline if you want an immutable tag.
 
 ## Not here yet
 
-- **Default-deny egress.** `exec` filters what is sent through the proxy; it does not yet stop a
-  process from ignoring it. See [What it does not do](#what-it-does-not-do) — the mechanism is known,
-  it just is not wired up.
+- **Transparent interception.** `exec` and `serve` filter what is *sent* through the proxy; neither
+  stops a process from ignoring `HTTPS_PROXY` and opening its own socket. The sidecar shape above
+  closes that off at the network layer today, but it takes a second container and a shared network
+  namespace. Doing it inside one container means redirecting outbound 80/443 with nftables and
+  reading the SNI off a raw `ClientHello` — the proxy is CONNECT-only right now, so this is real work
+  rather than a flag. See [What it does not do](#what-it-does-not-do).
 - **A blocklist feed.** The client already understands and enforces `blocked` entries, and the
   console already serves the field — but nothing populates it yet. Once a feed lands, every job
   picks it up on its next run with no change here.
