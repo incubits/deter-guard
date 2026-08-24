@@ -184,6 +184,39 @@ The proxy is configured for the build through the environment — `HTTPS_PROXY` 
 error deep inside a package manager, so they are all set. `deter-guard env` prints exactly that list,
 which is why it exists: a list copied into your repository stops matching ours the next time it grows.
 
+## What a refusal looks like
+
+A refused request gets a real HTTP **403**, delivered inside the TLS session, with a body naming the
+host and the policy version:
+
+```json
+{
+  "error": "egress_refused",
+  "decision": "deny_policy",
+  "host": "registry.npmjs.org",
+  "reason": "host not permitted by the egress policy",
+  "policy_version": 1787493039,
+  "fix": "permit this host in the deter console, under your organization's egress policy"
+}
+```
+
+Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward. The
+*status* is the point. Refusing the `CONNECT` instead looks like this to the client:
+
+```
+RequestAbortedError: Proxy response (403) !== 200 when HTTP Tunneling   (UND_ERR_ABORTED)
+```
+
+which is a **transport** error, and every package manager retries transport errors — that is what
+they are for. So a decision made in the first millisecond would be retried with backoff for minutes
+against a host that will never answer. None of them retry a 4xx. A real `pnpm install` against a
+refused registry now fails in **one second** with `ERR_PNPM_FETCH_403`, and you do not have to turn
+retries off in your own pipeline to get that.
+
+One quirk worth knowing: pnpm reacts to any 403 by printing your registry auth settings, so its
+output mentions authorization even though the refusal has nothing to do with credentials. The guard's
+own `DENY` line appears directly above it and says what actually happened.
+
 ## Adding the guard to an image you already build
 
 One `COPY`. The binary is static and carries its own root certificates, so it does not need a CA
