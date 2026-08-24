@@ -2,6 +2,9 @@
 //
 //	deter-guard whoami     what this pipeline authenticates as
 //	deter-guard policy     fetch + VERIFY the signed policy, write it to a file
+//	deter-guard exec       run ONE command behind the filtering proxy
+//	deter-guard serve      run the proxy on its own, so many commands can sit behind it
+//	deter-guard env        print the variables that point a build at a running proxy
 //
 // Designed to need nothing but a console URL. On GitHub Actions it mints its own OIDC token, so
 // there is no secret in the pipeline to leak; elsewhere DETER_ID_TOKEN or DETER_CI_TOKEN covers it.
@@ -25,6 +28,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -57,18 +61,32 @@ type opts struct {
 	project    string
 	run        string
 	asJSON     bool
-	// exec only
+	// exec and serve
 	policyFile string
 	stateDir   string
 	verbose    bool
+	// serve only
+	addr      string
+	port      int
+	caOut     string
+	readyFile string
+	detach    bool
+	wrap      bool
+	// env only
+	format   string
+	proxyURL string
+	caPath   string
+	unset    bool
 }
 
-const usage = `deter-guard — fetch this organization's signed egress policy in CI
+const usage = `deter-guard — fetch, verify and ENFORCE this organization's signed egress policy
 
 Usage:
   deter-guard whoami [options]
   deter-guard policy [options]
   deter-guard exec   [options] -- <command...>
+  deter-guard serve  [options] [--wrap -- <command...>]
+  deter-guard env    [options]
 
 Options:
   --console <url>    Console base URL             (env DETER_CONSOLE_URL)
@@ -79,10 +97,25 @@ Options:
   --run <ref>        Run id, deduplicates usage   (env DETER_RUN_ID)
   --json             Machine-readable output
 
-exec options:
+exec and serve options:
   --policy <path>    Use a local policy file instead of the console (UNSIGNED)
-  --state-dir <dir>  Where to write the CA the build must trust (default: temp dir)
+  --state-dir <dir>  Where the CA and state file go (env DETER_STATE_DIR, default: temp dir)
   --verbose          Log allowed requests too, not just refusals
+
+serve options:
+  --addr <ip>        Listen address (default 127.0.0.1; anything else is warned about)
+  --port <n>         Listen port    (default 3128; 0 lets the kernel pick)
+  --ca-out <path>    Write the CA here, and do not delete it on exit
+  --ready-file <p>   Write the proxy URL here once it is actually listening
+  --detach           Background the proxy and return once it is up
+  --wrap             Run one command on a FIXED port, then shut down
+
+env options:
+  --format <fmt>     sh (default), github, docker, json
+  --proxy <url>      Proxy URL   (default: read from the running guard)
+  --ca <path>        CA path     (default: read from the running guard)
+  --unset            Emit lines that CLEAR the variables instead of setting them
+
   --version          Print the version
   -h, --help         This
 
@@ -91,6 +124,9 @@ Credentials, in the order tried:
   2. GitHub Actions OIDC    automatic, needs ` + "`permissions: id-token: write`" + `
   3. DETER_CI_TOKEN         a long-lived dtrc_ token from the console
 
+The guard's own TLS roots are embedded, so it works when copied into an image that carries no CA
+store at all. DETER_GUARD_ROOTS=system|embedded|both (default both) changes that.
+
 Exit codes: 0 ok · 1 usage · 2 policy did NOT verify · 3 auth failed`
 
 func env(k, fallback string) string {
@@ -98,6 +134,21 @@ func env(k, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envInt is env() for a port. A value that is set but unparseable is a configuration mistake worth
+// naming: silently using the default would leave the operator looking at a port they did not choose.
+func envInt(k string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		errf("%s=%q is not a number — using %d", k, v, fallback)
+		return fallback
+	}
+	return n
 }
 
 // authenticate resolves a bearer token for the CI API.
@@ -146,11 +197,17 @@ func run() int {
 		fmt.Println(version)
 		return exitOK
 	}
-	if cmd != "whoami" && cmd != "policy" && cmd != "exec" {
+	switch cmd {
+	case "whoami", "policy", "exec", "serve", "env":
+	default:
 		errf("unknown command %q", cmd)
 		fmt.Println(usage)
 		return exitUsage
 	}
+
+	// Before anything makes a TLS connection. See roots.go: the guard carries its own root store so
+	// that being copied into a slim image does not silently break its own outbound TLS.
+	installRoots()
 
 	var o opts
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
@@ -166,11 +223,29 @@ func run() int {
 	fs.StringVar(&o.policyFile, "policy", env("DETER_POLICY_FILE", ""), "")
 	fs.StringVar(&o.stateDir, "state-dir", env("DETER_STATE_DIR", ""), "")
 	fs.BoolVar(&o.verbose, "verbose", false, "")
+	fs.StringVar(&o.addr, "addr", env("DETER_GUARD_ADDR", "127.0.0.1"), "")
+	fs.IntVar(&o.port, "port", envInt("DETER_GUARD_PORT", defaultProxyPort), "")
+	fs.StringVar(&o.caOut, "ca-out", env("DETER_GUARD_CA_OUT", ""), "")
+	fs.StringVar(&o.readyFile, "ready-file", "", "")
+	fs.BoolVar(&o.detach, "detach", false, "")
+	fs.BoolVar(&o.wrap, "wrap", false, "")
+	fs.StringVar(&o.format, "format", "sh", "")
+	fs.StringVar(&o.proxyURL, "proxy", "", "")
+	fs.StringVar(&o.caPath, "ca", "", "")
+	fs.BoolVar(&o.unset, "unset", false, "")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return exitUsage
 	}
-	if cmd == "exec" {
+
+	// These three resolve their own policy (or need none), so they run before the block below that
+	// insists on a console URL.
+	switch cmd {
+	case "exec":
 		return runExecCommand(o, fs.Args())
+	case "serve":
+		return runServeCommand(o, fs.Args())
+	case "env":
+		return runEnvCommand(o)
 	}
 
 	if o.consoleURL == "" {

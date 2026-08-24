@@ -21,7 +21,9 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 
-COPY *.go ./
+# roots.pem is //go:embed-ed into the binary (roots.go), so the build fails without it rather than
+# producing a guard that cannot verify its own TLS.
+COPY *.go roots.pem ./
 
 ARG TARGETOS
 ARG TARGETARCH

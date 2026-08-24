@@ -6,6 +6,10 @@ package main
 // points every tool we know about at both. Then the command runs and its exit code is passed through
 // — a wrapper that swallowed a build failure would be worse than no wrapper.
 //
+// This is the CI shape: one command, an ephemeral port, and a CA that is deleted on the way out. For
+// an image a customer already builds on — where the proxy has to outlive any one command and the
+// address has to be something an ENV can name — see serve.go.
+//
 // What this does NOT do is make the proxy unavoidable. `HTTPS_PROXY` is a request, and a malicious
 // postinstall can decline it. It is still the control that matters for the main threat, because it
 // sits in the path where packages are FETCHED: a blocked package is never downloaded, so its install
@@ -15,21 +19,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 )
 
 // proxyEnv returns the variables that point a child process at the proxy and its CA.
 //
 // Every ecosystem reads its own variable, and missing one shows up as an inscrutable certificate
 // error deep in a build rather than as a configuration problem. The list is the whole point of this
-// function existing.
+// function existing — and the reason `deter-guard env` exists rather than a README section telling
+// integrators to copy fourteen lines into their own pipeline, where they would then go stale.
 func proxyEnv(proxyURL, caPath string) []string {
 	noProxy := "localhost,127.0.0.1,::1"
 	return []string{
@@ -67,51 +69,25 @@ func runExec(o execOpts) (int, error) {
 	if len(o.argv) == 0 {
 		return exitUsage, errors.New("nothing to run: pass the command after --")
 	}
+	stateDir := o.stateDir
+	if stateDir == "" {
+		stateDir = os.TempDir()
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return exitUsage, fmt.Errorf("creating %s: %w", stateDir, err)
+	}
 
-	ca, err := newCertAuthority()
+	// Port 0: let the kernel choose, so two jobs on one runner never collide. The CA is ours to
+	// delete afterwards — nobody outside this process was ever told where it is.
+	g, err := startGuard(o.policy, o.reporter, "127.0.0.1", 0,
+		filepath.Join(stateDir, "deter-guard-ca.pem"), true, o.verbose)
 	if err != nil {
 		return exitUsage, err
 	}
-	if o.stateDir == "" {
-		o.stateDir = os.TempDir()
-	}
-	if err := os.MkdirAll(o.stateDir, 0o755); err != nil {
-		return exitUsage, fmt.Errorf("creating %s: %w", o.stateDir, err)
-	}
-	caPath := filepath.Join(o.stateDir, "deter-guard-ca.pem")
-	// 0644: the child may well run as a different user than the warden that wrote it.
-	if err := os.WriteFile(caPath, ca.caPEM(), 0o644); err != nil {
-		return exitUsage, fmt.Errorf("writing the CA to %s: %w", caPath, err)
-	}
-	defer os.Remove(caPath)
+	// Shuts the proxy down first so nothing new is recorded, then flushes what was.
+	defer g.stop()
 
-	// Port 0: let the kernel choose, so two jobs on one runner never collide.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return exitUsage, fmt.Errorf("opening the proxy port: %w", err)
-	}
-	proxyURL := "http://" + ln.Addr().String()
-
-	px := newProxy(o.policy, ca, o.reporter, o.verbose)
-	srv := &http.Server{Handler: px}
-	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logf("proxy stopped: %s", err)
-		}
-	}()
-
-	logf("egress proxy on %s · policy version %d · %d rule(s), %d block(s)",
-		proxyURL, o.policy.Version, len(o.policy.Rules), len(o.policy.Blocked))
-
-	code, runErr := runChild(o.argv, proxyEnv(proxyURL, caPath))
-
-	// Shut the proxy first so nothing new is recorded, then flush what was.
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	_ = srv.Shutdown(shutCtx)
-	cancel()
-	o.reporter.Close()
-
-	return code, runErr
+	return runChild(o.argv, proxyEnv(g.proxyURL, g.caPath))
 }
 
 // runChild execs the command, wiring through stdio and forwarding signals, and returns its exit code.
@@ -151,86 +127,103 @@ func runChild(argv []string, extraEnv []string) (int, error) {
 	return exitUsage, err
 }
 
-// runExecCommand resolves a policy, then runs the build behind the proxy.
+// resolvePolicy produces the policy the proxy will enforce, and the reporter to send refusals to.
+//
+// Shared by `exec` and `serve`, which must not differ on any of this. In particular the reporter is
+// constructed in exactly one branch — the console one — so a local --policy file gets enforcement
+// with no reporting, by construction rather than by omission. A policy nobody signed should not
+// produce attributed telemetry.
 //
 // A local --policy file needs no console and no credential, which makes the proxy testable and works
 // on an air-gapped runner. It is also unsigned, so it says so: a policy whose provenance nobody
 // checked should never look the same as one that verified.
+//
+// The int is the exit code to use when err is non-nil, so callers do not have to re-derive whether a
+// failure was configuration, authentication, or a signature that did not verify.
+func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
+	if o.policyFile != "" {
+		p, err := loadPolicyFile(o.policyFile)
+		if err != nil {
+			return nil, nil, exitUsage, err
+		}
+		logf("policy from %s (UNSIGNED — no console, nothing verified)", o.policyFile)
+		warnIfPermitsNothing(p)
+		return p, nil, exitOK, nil
+	}
+
+	if o.consoleURL == "" {
+		return nil, nil, exitUsage, errors.New(
+			"no console URL — pass --console, set DETER_CONSOLE_URL, or use --policy <file>")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*httpTimeout)
+	defer cancel()
+
+	token, how, sessionKey, err := authenticate(ctx, o)
+	if err != nil {
+		return nil, nil, exitAuth, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	headers := map[string]string{}
+	if o.project != "" {
+		headers["X-Deter-Project"] = o.project
+	}
+	if o.run != "" {
+		headers["X-Deter-Run"] = o.run
+	}
+
+	// Pin order matches `policy`: an explicitly pinned key wins, then the key the session reported
+	// at exchange time. Falling back to the key the policy response carries would be verifying a
+	// message against a key from the same message.
+	pinned := o.pubkey
+	if pinned == "" {
+		pinned = sessionKey
+	}
+
+	p, served, verified, err := fetchRules(ctx, o.consoleURL, token, pinned, headers)
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) && ae.Status < 500 {
+			return nil, nil, exitAuth, err
+		}
+		return nil, nil, exitUnverified, err
+	}
+	if verified {
+		logf("policy version %d verified against pinned key %s (via %s)",
+			p.Version, keyFingerprint(pinned), how)
+	} else {
+		logf("policy version %d verified against the key the CONSOLE SERVED (%s) — "+
+			"pin --pubkey to make this a real check", p.Version, keyFingerprint(served))
+	}
+
+	warnIfPermitsNothing(p)
+	return p, newReporter(baseURL(o.consoleURL)+"/api/report/attempts", token, headers), exitOK, nil
+}
+
+// warnIfPermitsNothing names the one policy that is valid, blocks everything, and looks like a bug.
+//
+// The only symptom otherwise is a build that fails at its first fetch, which reads as "the proxy is
+// broken" rather than "the policy is empty".
+func warnIfPermitsNothing(p *Policy) {
+	if len(p.Rules) == 0 {
+		errf("this policy permits NO hosts — every request will be refused")
+	}
+}
+
+// runExecCommand resolves a policy, then runs the build behind the proxy.
 func runExecCommand(o opts, argv []string) int {
 	if len(argv) == 0 {
 		errf("nothing to run — put the command after `--`, e.g. exec -- npm ci")
 		return exitUsage
 	}
 
-	var pol *Policy
-	var rep *reporter
-
-	if o.policyFile != "" {
-		p, err := loadPolicyFile(o.policyFile)
-		if err != nil {
-			errf("%s", err)
-			return exitUsage
-		}
-		pol = p
-		logf("policy from %s (UNSIGNED — no console, nothing verified)", o.policyFile)
-	} else {
-		if o.consoleURL == "" {
-			errf("no console URL — pass --console, set DETER_CONSOLE_URL, or use --policy <file>")
-			return exitUsage
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*httpTimeout)
-		token, how, sessionKey, err := authenticate(ctx, o)
-		if err != nil {
-			cancel()
-			errf("authentication failed: %s", err)
-			return exitAuth
-		}
-
-		headers := map[string]string{}
-		if o.project != "" {
-			headers["X-Deter-Project"] = o.project
-		}
-		if o.run != "" {
-			headers["X-Deter-Run"] = o.run
-		}
-
-		// Pin order matches `policy`: an explicitly pinned key wins, then the key the session
-		// reported at exchange time. Falling back to the key the policy response carries would be
-		// verifying a message against a key from the same message.
-		pinned := o.pubkey
-		if pinned == "" {
-			pinned = sessionKey
-		}
-
-		p, served, verified, err := fetchRules(ctx, o.consoleURL, token, pinned, headers)
-		cancel()
-		if err != nil {
-			errf("%s", err)
-			var ae *apiError
-			if errors.As(err, &ae) && ae.Status < 500 {
-				return exitAuth
-			}
-			return exitUnverified
-		}
-		pol = p
-		if verified {
-			logf("policy version %d verified against pinned key %s (via %s)",
-				p.Version, keyFingerprint(pinned), how)
-		} else {
-			logf("policy version %d verified against the key the CONSOLE SERVED (%s) — "+
-				"pin --pubkey to make this a real check", p.Version, keyFingerprint(served))
-		}
-
-		rep = newReporter(baseURL(o.consoleURL)+"/api/report/attempts", token, headers)
+	pol, rep, code, err := resolvePolicy(o)
+	if err != nil {
+		errf("%s", err)
+		return code
 	}
 
-	if len(pol.Rules) == 0 {
-		// A policy permitting nothing is valid and blocks everything. The only symptom is a build
-		// that fails at its first fetch, which reads as "the proxy is broken".
-		errf("this policy permits NO hosts — every request will be refused")
-	}
-
-	code, err := runExec(execOpts{
+	code, err = runExec(execOpts{
 		policy:   pol,
 		reporter: rep,
 		stateDir: o.stateDir,

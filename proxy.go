@@ -34,9 +34,9 @@ type proxy struct {
 	policy   *Policy
 	ca       *certAuthority
 	reporter *reporter
-	// Upstream client. Verifies origin certificates against the real system roots: intercepting the
-	// build's TLS must not mean accepting anything on the way out, or the proxy would downgrade the
-	// security it exists to enforce.
+	// Upstream client. Verifies origin certificates against real roots (see roots.go): intercepting
+	// the build's TLS must not mean accepting anything on the way out, or the proxy would downgrade
+	// the security it exists to enforce.
 	upstream *http.Transport
 	verbose  bool
 }
@@ -48,6 +48,7 @@ func newProxy(p *Policy, ca *certAuthority, r *reporter, verbose bool) *proxy {
 		reporter: r,
 		upstream: &http.Transport{
 			Proxy:                 nil, // never chain into another proxy by accident
+			TLSClientConfig:       &tls.Config{RootCAs: rootCAs()},
 			MaxIdleConnsPerHost:   16,
 			IdleConnTimeout:       60 * time.Second,
 			TLSHandshakeTimeout:   30 * time.Second,
