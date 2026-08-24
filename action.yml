@@ -1,0 +1,85 @@
+# The one line a pipeline should need.
+#
+#   - uses: incubits/deter-guard@v1
+#     with:
+#       console: ${{ vars.DETER_CONSOLE_URL }}
+#       pubkey:  ${{ vars.DETER_POLICY_PUBKEY }}
+#   - run: pnpm install          # guarded. no prefix, no environment to wire up.
+#
+# A JavaScript action rather than a composite one, for exactly one reason: composite actions cannot
+# declare a `post:` step. Teardown is not a nicety here — the guard flushes its refusal report on
+# SIGTERM, so a guard the runner reaps at job end enforces perfectly and tells the console nothing.
+# Leaving that to the consumer means every consumer who forgets loses their audit trail and never
+# finds out. `post:` runs whether the job passed, failed or was cancelled.
+#
+# No npm dependencies and no bundler: main.js and post.js use Node built-ins only, so what you review
+# in this repository is exactly what runs on the runner. An action whose job is supply-chain control
+# should not arrive with a node_modules of its own.
+name: deter-guard
+description: Enforce your organization's signed egress policy on this job. Default deny.
+author: incubits
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  console:
+    description: >-
+      Console base URL, e.g. https://deter-console.fly.dev. Required unless `policy` is given.
+    required: false
+    default: ""
+  pubkey:
+    description: >-
+      Pin the policy signing key (hex). Strongly recommended: without it the guard verifies the
+      bundle against the key the console served, which only proves the bundle agrees with itself.
+    required: false
+    default: ""
+  policy:
+    description: >-
+      Path to a local policy file to enforce INSTEAD of fetching one. Unsigned, and configures no
+      reporting at all. For testing and air-gapped runners only.
+    required: false
+    default: ""
+  image:
+    description: The guard image to take the binary from.
+    required: false
+    default: ghcr.io/incubits/deter-guard:latest
+  verify-attestation:
+    description: >-
+      Verify the image's build provenance before using it. Turn this off only if you have another
+      way to establish where the binary came from.
+    required: false
+    default: "true"
+  project:
+    description: Project id, for a dtrc_ token. Ignored when OIDC is available.
+    required: false
+    default: ""
+  run-id:
+    description: >-
+      Run id. Usage is deduplicated on this, so a re-run stays one counted run rather than inflating
+      your own numbers. Defaults to the workflow run id.
+    required: false
+    default: ""
+  transparent:
+    description: >-
+      Intercept the job's traffic at the kernel instead of pointing it here with environment
+      variables. Nothing has to opt in and nothing can opt out — a package's install script that
+      opens its own socket is filtered too. Needs sudo, which GitHub-hosted runners provide.
+      This runner's own control-plane hosts are permitted automatically, so a policy that forgets
+      them fails the build rather than stopping the runner reporting it.
+    required: false
+    default: "false"
+  verbose:
+    description: Log allowed requests too, not just refusals.
+    required: false
+    default: "false"
+  token:
+    description: Token used to pull the image and verify its attestation.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: node24
+  main: action/main.js
+  post: action/post.js

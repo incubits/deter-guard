@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -255,8 +256,15 @@ func TestProxyBlocksOnePathOverHTTPS(t *testing.T) {
 	}
 }
 
-func TestProxyRefusesAnUnlistedHostAtConnect(t *testing.T) {
+func TestProxyRefusesAnUnlistedHostWithARealStatus(t *testing.T) {
+	// Two properties that pull in opposite directions, which is exactly why they are asserted
+	// together. The refusal must arrive as an HTTP 403, because a client shown a broken tunnel
+	// treats it as a transport failure and RETRIES a decision that can never change — eighteen
+	// minutes of backoff against a host refused in the first millisecond. And the origin must never
+	// be contacted, because answering politely must not mean connecting.
+	var reached atomic.Int64
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Add(1)
 		w.Write([]byte("should not be reachable"))
 	}))
 	defer origin.Close()
@@ -264,20 +272,91 @@ func TestProxyRefusesAnUnlistedHostAtConnect(t *testing.T) {
 	originRoot.AddCert(origin.Certificate())
 
 	// Policy permits a different host entirely.
-	p := &Policy{Rules: []Rule{{Host: "somewhere.else.example.com"}}}
+	p := &Policy{Version: 99, Rules: []Rule{{Host: "somewhere.else.example.com"}}}
 	client, stop := startProxy(t, p, originRoot)
 	defer stop()
 
 	res, err := client.Get(origin.URL + "/anything")
 	if err != nil {
-		// A refused CONNECT surfaces as a transport error, which is the correct outcome.
-		if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "Forbidden") {
-			t.Logf("refused with: %v", err)
-		}
-		return
+		t.Fatalf("a refusal must be an HTTP response, not a transport error — package managers "+
+			"retry transport errors and do not retry 4xx; got: %v", err)
 	}
 	defer res.Body.Close()
-	t.Fatalf("an unlisted host must not be reachable, got HTTP %d", res.StatusCode)
+
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", res.StatusCode)
+	}
+	if n := reached.Load(); n != 0 {
+		t.Fatalf("the refused origin was contacted %d time(s) — a refusal must not dial upstream", n)
+	}
+
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "egress_refused") {
+		t.Fatalf("refusal body does not identify itself: %s", body)
+	}
+	// It must say which host and which policy, or the developer is guessing at exactly the moment
+	// they need to act.
+	if !strings.Contains(string(body), "127.0.0.1") {
+		t.Fatalf("refusal body does not name the host: %s", body)
+	}
+	if got := res.Header.Get("X-Deter-Policy-Version"); got != "99" {
+		t.Fatalf("X-Deter-Policy-Version = %q, want 99", got)
+	}
+	if got := res.Header.Get("X-Deter-Decision"); got != "deny_policy" {
+		t.Fatalf("X-Deter-Decision = %q, want deny_policy", got)
+	}
+}
+
+func TestARefusedHostIsReportedOncePerTunnelNotPerRetry(t *testing.T) {
+	// The console shows blocked attempts. Now that a refused tunnel stays open and answers 403 to
+	// whatever is asked, recording each of those answers would turn one client's retry loop into a
+	// burst of distinct refusals — making a single misconfigured host look like an incident.
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer origin.Close()
+	originRoot := x509.NewCertPool()
+	originRoot.AddCert(origin.Certificate())
+
+	ca, err := newCertAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &reporter{windows: map[windowKey]*window{}, stop: make(chan struct{}), done: make(chan struct{})}
+	px := newProxy(&Policy{Version: 3, Rules: []Rule{{Host: "somewhere.else.example.com"}}}, ca, rep, false)
+	px.upstream.TLSClientConfig = &tls.Config{RootCAs: originRoot}
+	srv := httptest.NewServer(px)
+	defer srv.Close()
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca.caPEM())
+	u, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(u),
+		TLSClientConfig: &tls.Config{RootCAs: pool},
+		// Force a fresh tunnel each time, which is the pessimistic case for double counting.
+		DisableKeepAlives: true,
+	}}
+
+	for i := range 3 {
+		res, err := client.Get(origin.URL + "/anything")
+		if err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		res.Body.Close()
+	}
+
+	rep.mu.Lock()
+	defer rep.mu.Unlock()
+	if len(rep.windows) != 1 {
+		t.Fatalf("want one refusal window for one refused host, got %d", len(rep.windows))
+	}
+	for k, w := range rep.windows {
+		if k.method != "CONNECT" {
+			t.Errorf("recorded as %q, want CONNECT — the decision was made at the tunnel", k.method)
+		}
+		if w.count != 3 {
+			t.Errorf("count = %d, want 3 collapsed into one window", w.count)
+		}
+	}
 }
 
 func TestReporterOnlySeesRefusals(t *testing.T) {
