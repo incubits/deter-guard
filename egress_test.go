@@ -197,8 +197,8 @@ func TestProxyFiltersPlainHTTP(t *testing.T) {
 	host := strings.TrimPrefix(origin.URL, "http://")
 
 	p := &Policy{
-		Rules:   []Rule{{Host: hostOnly(host)}},
-		Blocked: []Block{{Host: hostOnly(host), PathGlobs: []string{"*/blocked.tgz"}, Reason: "on the blocklist"}},
+		Rules:   []Rule{{Host: mustHost(t, host)}},
+		Blocked: []Block{{Host: mustHost(t, host), PathGlobs: []string{"*/blocked.tgz"}, Reason: "on the blocklist"}},
 	}
 	client, stop := startProxy(t, p, nil)
 	defer stop()
@@ -224,7 +224,7 @@ func TestProxyBlocksOnePathOverHTTPS(t *testing.T) {
 
 	originRoot := x509.NewCertPool()
 	originRoot.AddCert(origin.Certificate())
-	host := hostOnly(strings.TrimPrefix(origin.URL, "https://"))
+	host := mustHost(t, strings.TrimPrefix(origin.URL, "https://"))
 
 	p := &Policy{
 		Rules: []Rule{{Host: host}},

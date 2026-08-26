@@ -75,16 +75,23 @@ type Decision struct {
 // subdomains that silently also opened the parent domain would be a surprise in the widening
 // direction, which is the direction that matters.
 func hostMatches(pattern, host string) bool {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	host = strings.ToLower(strings.TrimSpace(host))
+	pattern = canonicalHost(pattern)
+	host = canonicalHost(host)
 	if pattern == "" || host == "" {
+		return false
+	}
+	// A host that is not a plain name or address matches NOTHING — not a permit, and not a block.
+	// The suffix test below is only sound over bytes that cannot also mean something to a URL
+	// parser: `evil.com#.example.com` ends in `.example.com` and resolves to evil.com, which is how
+	// a `*.example.com` rule became a way out to anywhere. See canonical.go.
+	if !validHostname(host) {
 		return false
 	}
 	if pattern == host {
 		return true
 	}
 	if suffix, ok := strings.CutPrefix(pattern, "*."); ok {
-		return strings.HasSuffix(host, "."+suffix)
+		return suffix != "" && strings.HasSuffix(host, "."+suffix)
 	}
 	return false
 }
@@ -184,6 +191,9 @@ func anyPrefix(prefixes []string, path string) bool {
 
 // Check decides one request.
 func (p *Policy) Check(host, method, path string) Decision {
+	if d, ok := refuseMalformedHost(host); ok {
+		return d
+	}
 	if b, ok := p.blocked(host, path); ok {
 		reason := b.Reason
 		if reason == "" {
@@ -206,6 +216,9 @@ func (p *Policy) Check(host, method, path string) Decision {
 //
 // A host on the blocklist with no path globs is refused here, before any bytes flow.
 func (p *Policy) CheckTunnel(host string) Decision {
+	if d, ok := refuseMalformedHost(host); ok {
+		return d
+	}
 	if b, ok := p.blocked(host, ""); ok && len(b.PathGlobs) == 0 {
 		reason := b.Reason
 		if reason == "" {
@@ -219,4 +232,21 @@ func (p *Policy) CheckTunnel(host string) Decision {
 		}
 	}
 	return Decision{Allow: false, Kind: "deny_policy", Reason: "host not permitted by the egress policy"}
+}
+
+// refuseMalformedHost is the belt to hostMatches' braces.
+//
+// hostMatches already refuses to match an unparseable host, which makes default-deny do the right
+// thing on its own. This says so explicitly instead, because "no rule happened to match" and "this
+// host is not a hostname" deserve different words in a build log — and because a future rule form
+// that does not go through hostMatches should not silently inherit the hole.
+func refuseMalformedHost(host string) (Decision, bool) {
+	if validHostname(canonicalHost(host)) {
+		return Decision{}, false
+	}
+	return Decision{
+		Allow:  false,
+		Kind:   "deny_policy",
+		Reason: "malformed host — not a hostname or IP address",
+	}, true
 }

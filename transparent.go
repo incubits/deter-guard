@@ -90,7 +90,7 @@ func (p *proxy) serveTransparentTLS(conn net.Conn) {
 	}
 
 	// Port 443 by definition: this connection was redirected from it.
-	p.serveTunnel(tlsConn, net.JoinHostPort(sni, "443"))
+	p.serveTunnel(tlsConn, sni, "443")
 }
 
 // transparentHTTP handles requests redirected from port 80.
@@ -100,26 +100,37 @@ func (p *proxy) serveTransparentTLS(conn net.Conn) {
 // Host header) because the client thinks it reached the origin.
 func (p *proxy) transparentHTTP() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := hostOnly(r.Host)
-		if host == "" {
+		if r.Host == "" {
 			// Same reasoning as a missing SNI: unidentifiable is refused.
 			d := Decision{Kind: "deny_policy", Reason: "no Host header"}
 			p.record(d, "<no Host>", r.Method, r.URL.Path)
 			p.writeRefusal(w, d, "")
 			return
 		}
+		// Redirected traffic reaches us because the kernel sent it here, not because a client chose
+		// to — so the Host header is the only thing naming the destination, and it is exactly as
+		// attacker-controlled as it is in the tunnel. Same parse, same refusal.
+		host, port, ok := splitAuthority(r.Host)
+		if !ok {
+			p.record(malformedHost, r.Host, r.Method, r.URL.Path)
+			p.writeRefusal(w, malformedHost, "")
+			return
+		}
+		forward, match, ok := cleanPath(r.URL.EscapedPath())
+		if !ok {
+			p.record(malformedPath, host, r.Method, r.URL.EscapedPath())
+			p.writeRefusal(w, malformedPath, host)
+			return
+		}
 
-		d := p.policy.Check(host, r.Method, r.URL.Path)
-		p.record(d, host, r.Method, r.URL.Path)
+		d := p.policy.Check(host, r.Method, match)
+		p.record(d, host, r.Method, match)
 		if !d.Allow {
 			p.writeRefusal(w, d, host)
 			return
 		}
 
-		out := *r.URL
-		out.Scheme = "http"
-		out.Host = r.Host
-		p.forward(w, r, out.String())
+		p.forward(w, r, upstreamURL("http", host, port, forward, match, r.URL.RawQuery))
 	})
 }
 
