@@ -1,4 +1,4 @@
-# Build and publish the deter-guard image to GitHub Container Registry.
+# Build, publish and release deter-guard.
 #
 # This is the image SREs put in their pipelines, so the supply chain OF THE THING THAT GUARDS THE
 # SUPPLY CHAIN matters more than usual:
@@ -8,28 +8,133 @@
 #     it. That's the reason the guard lives here rather than inside the private console repo;
 #   * third-party actions pinned to commit SHAs.
 #
-# Tags produced:
-#   ghcr.io/<owner>/deter-guard:latest        every push to main
-#   ghcr.io/<owner>/deter-guard:sha-<sha>     every push (immutable — pin this in a pipeline)
-#   ghcr.io/<owner>/deter-guard:1.2.3, :1.2, :1   on a v1.2.3 tag
+# RELEASING. The version lives in one place: the `VERSION` file. A pull request that changes it is
+# a release; every merge to main whose VERSION is already tagged is not. That is deliberately an
+# explicit, reviewed act rather than something inferred from commit-message prefixes — the difference
+# between 1.3.0 and 2.0.0 is a promise to everyone pinning `@v1`, and it should be made by a person
+# in a diff, not by a regex over a subject line.
 #
-# Setup: none. GITHUB_TOKEN can publish to this repository's own package registry.
+# When VERSION names something not yet tagged, a push to main:
+#   1. builds and pushes the image tagged 1.2.3, 1.2, 1 and latest;
+#   2. tags the commit v1.2.3 and MOVES v1.2 and v1 onto it, so `uses: …@v1` resolves;
+#   3. cuts a GitHub Release with generated notes and the image digest.
+#
+# Steps 1 and 3 live in one workflow on purpose. Pushing a tag with GITHUB_TOKEN does not start
+# another workflow run — GitHub refuses, to stop workflows triggering themselves — so a separate
+# tag-then-build design would silently never build, or need a PAT this repository does not want.
+#
+# Tags produced:
+#   ghcr.io/<owner>/deter-guard:sha-<sha>          every push (immutable — the strongest pin)
+#   ghcr.io/<owner>/deter-guard:main               every push to main (tip of trunk, unreleased)
+#   ghcr.io/<owner>/deter-guard:1.2.3, :1.2, :1    a release
+#   ghcr.io/<owner>/deter-guard:latest             the newest RELEASE, not the tip of main
+#
+# Setup: none. GITHUB_TOKEN can publish to this repository's own package registry and push tags.
+# If tag protection rules are ever added, `v*` has to admit github-actions[bot] or step 2 fails.
 name: Image
 
 on:
   push:
     branches: [main]
+    # A tag pushed by hand still builds its image, for the case where a release has to be cut from
+    # somewhere other than a merge. The release job below stays out of the way of one.
     tags: ["v*.*.*"]
   pull_request:
 
 concurrency:
   group: image-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseding a pull request build is free; superseding a release half-way through is not — it can
+  # leave an image pushed with no tag pointing at it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      # 1.2.3 — what VERSION says, always.
+      version: ${{ steps.v.outputs.version }}
+      major: ${{ steps.v.outputs.major }}
+      minor: ${{ steps.v.outputs.minor }}
+      # "true" only when this very run should cut the release.
+      release: ${{ steps.v.outputs.release }}
+      # What gets stamped into the binary — see below, this is not always `version`.
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      # fetch-depth stays at 1: the tag lookup asks the remote rather than the local clone, which is
+      # both authoritative and cheaper than fetching every tag to answer one question.
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+
+          # Refuse anything the image tagging and the `@v1` convention cannot represent. A typo here
+          # would otherwise become a permanent tag on a public registry.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error file=VERSION::VERSION must be MAJOR.MINOR.PATCH — got '$version'"
+            exit 1
+          fi
+          major=${version%%.*}
+          rest=${version#*.}
+          minor=${rest%%.*}
+
+          released=false
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            released=true
+          fi
+
+          release=false
+          build="$version-dev.${SHA:0:7}"
+          case "$REF" in
+            refs/tags/*)
+              # A hand-pushed tag. The tag already exists, so there is nothing to release — but the
+              # binary must not claim a version other than the one being tagged.
+              tag=${REF#refs/tags/}
+              if [ "$tag" != "v$version" ]; then
+                echo "::error file=VERSION::tag $tag does not match VERSION ($version). Bump VERSION in the commit you are tagging."
+                exit 1
+              fi
+              build=$version
+              ;;
+            refs/heads/main)
+              if [ "$EVENT" = push ] && [ "$released" = false ]; then
+                release=true
+                build=$version
+              fi
+              ;;
+          esac
+
+          # Anything that is not itself a release is stamped 1.2.3-dev.<sha>: a prerelease of the
+          # version being worked towards, so it sorts BELOW 1.2.3 and `--version` never claims to be
+          # a release it is not.
+          {
+            echo "version=$version"
+            echo "major=$major"
+            echo "minor=$minor"
+            echo "release=$release"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+          # Say plainly, on the run summary, whether merging this cuts a release. A version bump
+          # that was forgotten is otherwise a silent no-op, which is the failure mode of every
+          # scheme like this one.
+          if [ "$release" = true ]; then
+            echo "Releasing **v$version**." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$released" = false ]; then
+            echo "Merging this cuts release **v$version**." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No release: **v$version** is already tagged. Bump \`VERSION\` to cut a new one." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -57,8 +162,10 @@ jobs:
 
   image:
     name: Build and publish
-    needs: test
+    needs: [version, test]
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -92,7 +199,10 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.release == 'true' }}
+            type=raw,value=${{ needs.version.outputs.major }}.${{ needs.version.outputs.minor }},enable=${{ needs.version.outputs.release == 'true' }}
+            type=raw,value=${{ needs.version.outputs.major }},enable=${{ needs.version.outputs.release == 'true' }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.release == 'true' || startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=deter-guard
             org.opencontainers.image.description=Fetch and verify an organization's signed egress policy from CI. Static binary in a scratch image.
@@ -102,8 +212,11 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          # Not meta.outputs.version, which is whichever tag happened to sort first and is the branch
+          # name on a branch build. `deter-guard --version` should answer with the release, or with
+          # an unmistakable 1.2.3-dev.<sha> when it is not one.
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ needs.version.outputs.build }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -132,6 +245,97 @@ jobs:
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/deter-guard
           DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED: ${{ needs.version.outputs.build }}
         run: |
+          set -euo pipefail
           docker run --rm "${IMAGE}@${DIGEST}" --help
-          docker run --rm "${IMAGE}@${DIGEST}" --version
+          got=$(docker run --rm "${IMAGE}@${DIGEST}" --version)
+          # A release whose binary reports the wrong version is a support ticket that takes an hour
+          # to believe. The ldflags stamp is one typo away from silently not applying.
+          if [ "$got" != "$EXPECTED" ]; then
+            echo "::error::image reports version '$got', expected '$EXPECTED'"
+            exit 1
+          fi
+          echo "version stamp verified: $got"
+
+  release:
+    name: Tag and release
+    needs: [version, image]
+    # Only a merge to main cuts a release, and only when VERSION names something not yet tagged.
+    # A hand-pushed tag is excluded: its tag already exists, so there is nothing here to create.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # To push the tags and create the release. Nothing else in this workflow can write to the repo.
+      contents: write
+    steps:
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+
+      - name: Tag
+        env:
+          V: ${{ needs.version.outputs.version }}
+          MAJOR: ${{ needs.version.outputs.major }}
+          MINOR: ${{ needs.version.outputs.minor }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # v1.2.3 is immutable and goes first: if anything below fails, the release can be finished
+          # by hand from a tag that already points at the right commit.
+          git tag -a "v$V" -m "deter-guard v$V"
+          git push origin "refs/tags/v$V"
+
+          # v1.2 and v1 MOVE. That is the convention `uses: …@v1` depends on, and it is why this
+          # repository cannot simply never force-push a tag: a major series that does not advance
+          # means everyone pinned to it is frozen at the first release forever.
+          git tag -f -a "v$MAJOR.$MINOR" -m "deter-guard v$MAJOR.$MINOR -> v$V"
+          git tag -f -a "v$MAJOR" -m "deter-guard v$MAJOR -> v$V"
+          git push --force origin "refs/tags/v$MAJOR.$MINOR" "refs/tags/v$MAJOR"
+
+      # If this step fails after the tags above have been pushed, a re-run will not retry it: the
+      # version job will see v1.2.3 on the remote and decide there is nothing to release. Finish it
+      # by hand instead — the tags are already correct:
+      #
+      #   gh release create v1.2.3 --verify-tag --title v1.2.3 --generate-notes
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          V: ${{ needs.version.outputs.version }}
+          MAJOR: ${{ needs.version.outputs.major }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/deter-guard
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # GitHub writes the "what changed" half from the merged pull requests. Asked for
+          # separately rather than via `--generate-notes`, which would replace the preamble below
+          # rather than follow it.
+          gh api "repos/$REPO/releases/generate-notes" -f tag_name="v$V" -q .body > generated.md
+
+          {
+            echo '```yaml'
+            echo "- uses: $REPO@v$V   # or @v$MAJOR to follow this major series"
+            echo '```'
+            echo
+            echo "The action pulls the image built from this same commit, so the pin above pins the"
+            echo "binary too."
+            echo
+            echo '```'
+            echo "$IMAGE:$V"
+            echo "$IMAGE@$DIGEST"
+            echo "gh attestation verify oci://$IMAGE:$V --repo $REPO"
+            echo '```'
+            echo
+            cat generated.md
+          } > notes.md
+
+          # --verify-tag: refuse to invent a tag. If the step above somehow did not push one, fail
+          # rather than quietly create a release pointing somewhere else.
+          gh release create "v$V" --repo "$REPO" --verify-tag --title "v$V" --notes-file notes.md
+
+          echo "Released **v$V** — $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"

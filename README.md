@@ -65,10 +65,38 @@ npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3
 | `pubkey` | — | Pin the policy signing key (hex). **Strongly recommended.** |
 | `transparent` | `false` | Intercept at the kernel instead of via proxy variables. See [Modes](#modes). |
 | `policy` | — | Local **unsigned** policy file to enforce instead of fetching one. |
-| `image` | `ghcr.io/incubits/deter-guard:latest` | Image to take the binary from. |
+| `image` | matches the action's own ref | Image to take the binary from. Set it only to pull from a mirror of your own — see [Versions](#versions). |
 | `verify-attestation` | `true` | Verify the image's build provenance before using it. |
 | `verbose` | `false` | Log allowed requests too, not just refusals. |
 | `project` / `run-id` | — | For `dtrc_` tokens. Ignored when OIDC is available. |
+
+### Versions
+
+The action and the image are one release, cut from one commit. **Pinning the action pins the binary
+it runs** — the default `image` is derived from the ref you wrote after the `@`, so there is no
+floating tag hiding behind a version number.
+
+| You write | You get | |
+| --- | --- | --- |
+| `@v1` | newest 1.x | Fixes and features arrive on their own. Nothing breaking. |
+| `@v1.4` | newest 1.4.x | Patches only. |
+| `@v1.4.2` | exactly that | Reproducible. Update it deliberately. |
+| `@<commit sha>` | exactly that | The strongest pin. Resolves to the `sha-<short>` image. |
+| `@main` | tip of trunk | Untagged and unreleased. For trying something out. |
+
+Image tags follow the same shape, plus `:latest`, which is the **newest release** — not the tip of
+`main`, which is `:main`:
+
+```
+ghcr.io/incubits/deter-guard:1        # newest 1.x
+ghcr.io/incubits/deter-guard:1.4.2    # exactly that
+ghcr.io/incubits/deter-guard@sha256:… # a digest, from the release notes
+```
+
+Versions are semver, and the major number is a promise about the action inputs, the CLI flags and
+the environment variables — the surfaces you have written down somewhere. Every release is a
+[GitHub release](https://github.com/incubits/deter-guard/releases) with generated notes and the
+image digest.
 
 ---
 
@@ -163,7 +191,7 @@ GitLab requires the job to *declare* its ID token, so pass it as `DETER_ID_TOKEN
 
 ```yaml
 policy:
-  image: ghcr.io/incubits/deter-guard:latest
+  image: ghcr.io/incubits/deter-guard:1
   id_tokens:
     DETER_ID_TOKEN: { aud: "deter-console" }
   variables:
@@ -182,7 +210,7 @@ docker run --rm \
   -e DETER_CI_TOKEN="$DETER_CI_TOKEN" \
   -e DETER_POLICY_PUBKEY="$DETER_POLICY_PUBKEY" \
   -v "$PWD:/workspace" \
-  ghcr.io/incubits/deter-guard:latest \
+  ghcr.io/incubits/deter-guard:1 \
   policy --project "$JOB_NAME" --run "$BUILD_TAG" --out /workspace/egress.cedar
 ```
 
@@ -318,7 +346,7 @@ One `COPY`. The binary is static and carries its own root certificates, so it ne
 libc, or anything else from the image it lands in:
 
 ```dockerfile
-COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
 ```
 
 There are four ways to put it in front of a build, differing in how hard it is for the build to get
@@ -342,7 +370,7 @@ container, at the cost of needing Linux and root.
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
 RUN deter-guard exec -- npm ci
 ```
 
@@ -355,7 +383,7 @@ inherit it:
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
 
 # A FIXED port and CA path, so these can be baked in — which is what makes
 # `docker exec` into a running container covered too, not just the CMD.
@@ -398,7 +426,7 @@ proxy, rewrite its rules, or unset its way around it, because none of it is in i
 ```yaml
 services:
   guard:
-    image: ghcr.io/incubits/deter-guard:latest
+    image: ghcr.io/incubits/deter-guard:1
     command: ["serve", "--addr", "0.0.0.0", "--port", "3128", "--ca-out", "/shared/ca.pem"]
     volumes: ["shared:/shared"]
   build:
@@ -466,10 +494,11 @@ Distinct on purpose — a pipeline shouldn't have to grep stderr.
 Built by GitHub Actions with a provenance attestation:
 
 ```bash
-gh attestation verify oci://ghcr.io/incubits/deter-guard:latest --repo incubits/deter-guard
+gh attestation verify oci://ghcr.io/incubits/deter-guard:1 --repo incubits/deter-guard
 ```
 
-Pin `sha-<commit>` for an immutable tag.
+Pin `sha-<commit>`, or the digest from the release notes, for an immutable reference. See
+[Versions](#versions).
 
 > **Maintainers:** a GHCR package published by Actions starts **private**, even from a public
 > repository — it does not inherit repo visibility. Until it's switched, an anonymous `docker pull`
@@ -495,9 +524,28 @@ Pin `sha-<commit>` for an immutable tag.
 ```bash
 go test ./...
 go vet ./...
+node --test action/inputs.test.js  # the action is JavaScript; `go test` never sees it
 go build -o deter-guard .          # local binary
 docker build -t deter-guard:dev .  # the scratch image
 ```
+
+### Cutting a release
+
+Edit `VERSION`, in the pull request that earns the bump:
+
+```
+1.4.2
+```
+
+Merging it does the rest — image tags `1.4.2`, `1.4`, `1` and `latest`, git tags `v1.4.2` plus a
+moved `v1.4` and `v1`, and a GitHub release with generated notes and the image digest. A merge that
+leaves `VERSION` alone publishes `:main` and `:sha-<commit>` and releases nothing; every pull request
+says which of the two it is on its checks summary, so a forgotten bump is visible before it merges
+rather than after.
+
+Deciding the number is the reviewer's job, not a workflow's. `1.4.2` → `2.0.0` is a promise being
+broken for everyone pinned to `@v1`, and that belongs in a diff a person approved, not in a prefix
+parsed out of a commit subject.
 
 Go cross-compiles, so the multi-arch image needs no QEMU: the Dockerfile runs the compiler natively
 on the builder and targets each platform via `GOOS`/`GOARCH`. An arm64 image costs seconds rather

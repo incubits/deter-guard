@@ -42,9 +42,12 @@ inputs:
     required: false
     default: ""
   image:
-    description: The guard image to take the binary from.
+    description: >-
+      The guard image to take the binary from. Leave unset: the default is the image built from the
+      same commit as this action, so `@v1.2.3` pins the binary as well as the YAML. Set it only to
+      pull from a mirror of your own.
     required: false
-    default: ghcr.io/incubits/deter-guard:latest
+    default: ""
   verify-attestation:
     description: >-
       Verify the image's build provenance before using it. Turn this off only if you have another
