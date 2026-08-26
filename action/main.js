@@ -53,7 +53,9 @@ function main() {
   fs.mkdirSync(stateDir, { recursive: true })
   fs.mkdirSync(binDir, { recursive: true })
 
-  const image = input('image')
+  // Not `input('image')`: unset means "the image built from the same commit as this action", which
+  // is what makes pinning the action a real pin. See inputs.js.
+  const image = inputs.imageFor(process.env)
   const token = input('token')
   const guard = path.join(binDir, 'deter-guard')
 
