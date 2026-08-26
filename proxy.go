@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -70,11 +71,19 @@ func newProxy(p *Policy, ca *certAuthority, r *reporter, verbose bool) *proxy {
 	}
 }
 
-func hostOnly(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
-	}
-	return hostport
+// malformedHost is the refusal for an authority that is not a host — see canonical.go for why one
+// is refused outright rather than cleaned up.
+var malformedHost = Decision{
+	Allow:  false,
+	Kind:   "deny_policy",
+	Reason: "malformed host — not a hostname or IP address",
+}
+
+// malformedPath is the refusal for a request target that cannot be decoded.
+var malformedPath = Decision{
+	Allow:  false,
+	Kind:   "deny_policy",
+	Reason: "malformed request path — invalid percent-encoding",
 }
 
 // record sends a refusal to the console and, when asked, prints it. Allowed requests are never
@@ -98,22 +107,29 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Absolute-form request: a plain HTTP proxy request.
-	host := hostOnly(r.Host)
-	if host == "" {
-		host = hostOnly(r.URL.Host)
+	authority := r.Host
+	if authority == "" {
+		authority = r.URL.Host
 	}
-	d := p.policy.Check(host, r.Method, r.URL.Path)
-	p.record(d, host, r.Method, r.URL.Path)
+	host, port, ok := splitAuthority(authority)
+	if !ok {
+		p.record(malformedHost, authority, r.Method, r.URL.Path)
+		p.writeRefusal(w, malformedHost, "")
+		return
+	}
+	forward, match, ok := cleanPath(r.URL.EscapedPath())
+	if !ok {
+		p.record(malformedPath, host, r.Method, r.URL.EscapedPath())
+		p.writeRefusal(w, malformedPath, host)
+		return
+	}
+	d := p.policy.Check(host, r.Method, match)
+	p.record(d, host, r.Method, match)
 	if !d.Allow {
 		p.writeRefusal(w, d, host)
 		return
 	}
-	outURL := *r.URL
-	outURL.Scheme = "http"
-	if outURL.Host == "" {
-		outURL.Host = r.Host
-	}
-	p.forward(w, r, outURL.String())
+	p.forward(w, r, upstreamURL("http", host, port, forward, match, r.URL.RawQuery))
 }
 
 // A refusal has to arrive as an HTTP RESPONSE, not as a broken connection.
@@ -203,9 +219,14 @@ func (p *proxy) serveRefusals(conn net.Conn, authority string, d Decision) {
 	if err != nil {
 		return
 	}
-	host := hostOnly(authority)
+	host := authority
+	if h, _, ok := splitAuthority(authority); ok {
+		host = h
+	}
 	if req.Host != "" {
-		host = hostOnly(req.Host)
+		if h, _, ok := splitAuthority(req.Host); ok {
+			host = h
+		}
 	}
 	// Deliberately not recorded again: handleConnect already logged and reported this refusal once,
 	// at the tunnel. Counting it a second time per request would inflate every retry loop into the
@@ -214,13 +235,16 @@ func (p *proxy) serveRefusals(conn net.Conn, authority string, d Decision) {
 }
 
 func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
-	host := hostOnly(r.Host)
-	d := p.policy.CheckTunnel(host)
+	host, port, valid := splitAuthority(r.Host)
+	d := malformedHost
+	if valid {
+		d = p.policy.CheckTunnel(host)
+	}
 	if !d.Allow {
 		// Logged and reported HERE, once, while we still have the tunnel-level decision. What
 		// follows serves 403s without recording them again, so a client's retry loop does not
 		// arrive at the console as a stream of fresh refusals.
-		p.record(d, host, "CONNECT", "")
+		p.record(d, r.Host, "CONNECT", "")
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -238,9 +262,17 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	leaf, err := p.ca.leafFor(host)
+	// A refused connection still gets a certificate, because the refusal has to be delivered as a
+	// 403 inside the TLS session rather than as a broken pipe. An unparseable authority has no name
+	// to put in one, so it borrows the CA's — the client is about to be told no regardless, and the
+	// only thing that must not happen is minting a leaf for attacker-chosen bytes.
+	certName := host
+	if !valid {
+		certName = "invalid.deter-guard"
+	}
+	leaf, err := p.ca.leafFor(certName)
 	if err != nil {
-		logf("could not mint a certificate for %s: %s", host, err)
+		logf("could not mint a certificate for %s: %s", certName, err)
 		return
 	}
 	tlsConn := tls.Server(clientConn, &tls.Config{
@@ -254,7 +286,7 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err := tlsConn.Handshake(); err != nil {
 		// Almost always the client not trusting our CA. Say so plainly — this is the single most
 		// common way a working setup looks broken.
-		logf("TLS handshake with the build failed for %s (%s) — is the guard CA trusted?", host, err)
+		logf("TLS handshake with the build failed for %s (%s) — is the guard CA trusted?", certName, err)
 		return
 	}
 	defer tlsConn.Close()
@@ -266,14 +298,14 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The full authority, port included: the policy decides on the hostname, but the request has to
-	// be re-issued to the actual port. Stripping it sends everything to :443, which is invisible
+	// Host AND port travel separately from here: the policy decides on the hostname, but the request
+	// has to be re-issued to the actual port. Losing it sends everything to :443, which is invisible
 	// against a public registry and breaks any private one on another port.
-	p.serveTunnel(tlsConn, r.Host)
+	p.serveTunnel(tlsConn, host, port)
 }
 
 // serveTunnel reads requests off a terminated TLS connection and decides each one.
-func (p *proxy) serveTunnel(conn net.Conn, authority string) {
+func (p *proxy) serveTunnel(conn net.Conn, tunnelHost, tunnelPort string) {
 	br := bufio.NewReader(conn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -281,25 +313,47 @@ func (p *proxy) serveTunnel(conn net.Conn, authority string) {
 			return // client closed, or a malformed request; either way this connection is done
 		}
 
-		// A client's Host header wins when present — it is what the client believes it is talking to.
-		target := authority
+		// A client's Host header wins when present — it is what the client believes it is talking
+		// to, and it is re-checked against the policy below, so naming a different host is allowed
+		// but never free. It is also entirely attacker-controlled, which is why it is PARSED rather
+		// than pasted into a URL: this is the exact spot where `evil.com#.example.com` used to
+		// satisfy a `*.example.com` rule and then resolve to evil.com.
+		host, port := tunnelHost, tunnelPort
 		if req.Host != "" {
-			target = req.Host
+			h, prt, ok := splitAuthority(req.Host)
+			if !ok {
+				p.record(malformedHost, req.Host, req.Method, req.URL.EscapedPath())
+				_ = p.refusalResponse(malformedHost, "").Write(conn)
+				return
+			}
+			host = h
+			// A Host header carries no port in the ordinary case, and that must not silently move
+			// the request to :443 — the tunnel was opened to a specific port and that is where it
+			// goes unless the client says otherwise.
+			if prt != "" {
+				port = prt
+			}
 		}
-		reqHost := hostOnly(target)
-		path := req.URL.Path
-		d := p.policy.Check(reqHost, req.Method, path)
-		p.record(d, reqHost, req.Method, path)
 
-		if !d.Allow {
-			// Written straight onto the connection, since there is no ResponseWriter in here.
-			_ = p.refusalResponse(d, reqHost).Write(conn)
+		forward, match, ok := cleanPath(req.URL.EscapedPath())
+		if !ok {
+			p.record(malformedPath, host, req.Method, req.URL.EscapedPath())
+			_ = p.refusalResponse(malformedPath, host).Write(conn)
 			return
 		}
 
-		res, err := p.roundTrip(req, "https://"+target+req.URL.RequestURI())
+		d := p.policy.Check(host, req.Method, match)
+		p.record(d, host, req.Method, match)
+
+		if !d.Allow {
+			// Written straight onto the connection, since there is no ResponseWriter in here.
+			_ = p.refusalResponse(d, host).Write(conn)
+			return
+		}
+
+		res, err := p.roundTrip(req, upstreamURL("https", host, port, forward, match, req.URL.RawQuery))
 		if err != nil {
-			body := fmt.Sprintf("egress proxy could not reach %s: %s\n", reqHost, err)
+			body := fmt.Sprintf("egress proxy could not reach %s: %s\n", host, err)
 			res = &http.Response{
 				StatusCode:    http.StatusBadGateway,
 				ProtoMajor:    1,
@@ -329,11 +383,17 @@ func (p *proxy) serveTunnel(conn net.Conn, authority string) {
 
 // roundTrip re-issues one request upstream. The inbound request cannot be reused directly: it
 // carries an origin-form URL and hop-by-hop headers that must not be forwarded.
-func (p *proxy) roundTrip(req *http.Request, target string) (*http.Response, error) {
-	out, err := http.NewRequest(req.Method, target, req.Body)
+//
+// Takes a built *url.URL rather than a string on purpose. A target assembled from validated parts
+// cannot be re-read as a different address by the next parser to touch it, and there is no next
+// parser here — the URL goes onto the request as-is.
+func (p *proxy) roundTrip(req *http.Request, target *url.URL) (*http.Response, error) {
+	out, err := http.NewRequest(req.Method, "", req.Body)
 	if err != nil {
 		return nil, err
 	}
+	out.URL = target
+	out.Host = target.Host
 	copyHeaders(out.Header, req.Header)
 	out.Header.Del("Proxy-Connection")
 	out.Header.Del("Proxy-Authorization")
@@ -341,7 +401,7 @@ func (p *proxy) roundTrip(req *http.Request, target string) (*http.Response, err
 	return p.upstream.RoundTrip(out)
 }
 
-func (p *proxy) forward(w http.ResponseWriter, r *http.Request, target string) {
+func (p *proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	res, err := p.roundTrip(r, target)
 	if err != nil {
 		http.Error(w, "egress proxy could not reach the origin: "+err.Error(), http.StatusBadGateway)
