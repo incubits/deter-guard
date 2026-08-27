@@ -525,31 +525,25 @@ Pin `sha-<commit>`, or the digest from the release notes, for an immutable refer
 go test ./...
 go vet ./...
 node --test action/inputs.test.js  # the action is JavaScript; `go test` never sees it
+node --test ci/semantic.test.js    # the naming and version rules
 go build -o deter-guard .          # local binary
 docker build -t deter-guard:dev .  # the scratch image
 ```
 
-### Cutting a release
-
-Edit `VERSION`, in the pull request that earns the bump:
-
-```
-1.4.2
-```
-
-Merging it does the rest — image tags `1.4.2`, `1.4`, `1` and `latest`, git tags `v1.4.2` plus a
-moved `v1.4` and `v1`, and a GitHub release with generated notes and the image digest. A merge that
-leaves `VERSION` alone publishes `:main` and `:sha-<commit>` and releases nothing; every pull request
-says which of the two it is on its checks summary, so a forgotten bump is visible before it merges
-rather than after.
-
-Deciding the number is the reviewer's job, not a workflow's. `1.4.2` → `2.0.0` is a promise being
-broken for everyone pinned to `@v1`, and that belongs in a diff a person approved, not in a prefix
-parsed out of a commit subject.
-
 Go cross-compiles, so the multi-arch image needs no QEMU: the Dockerfile runs the compiler natively
 on the builder and targets each platform via `GOOS`/`GOARCH`. An arm64 image costs seconds rather
 than minutes of emulation.
+
+### Branches, commits, releases
+
+Branches are `type/short-slug` and commit subjects are
+[Conventional Commits](https://www.conventionalcommits.org) with the description left as prose —
+`feat(proxy)!: Decide on the same request you send`. Both are enforced in CI, and both exist to serve
+one thing: releasing is editing `VERSION`, and the types are how CI checks the number you chose is
+big enough for everything unreleased. A `feat` that has landed cannot ship as a patch.
+
+The rules, the types, and how to cut a release are in [CONTRIBUTING.md](CONTRIBUTING.md); they live
+in code as [`ci/semantic.js`](ci/semantic.js).
 
 Nothing here depends on the console's source. The verifier is a deliberate re-implementation — a CI
 runner shouldn't pull in a web framework and a database driver to check a signature — and a test pins
