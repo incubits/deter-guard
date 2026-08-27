@@ -2,6 +2,10 @@
 .git
 .github
 *.md
+# JavaScript, both of them: the action that runs on the runner, and the CI checks. Neither is
+# copied by the Dockerfile, so neither belongs in the context.
+action
+ci
 deter-guard
 dist
 *.test
