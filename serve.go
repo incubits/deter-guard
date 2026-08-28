@@ -225,16 +225,16 @@ func (g *guardServer) goTransparent(o opts, pol *Policy) error {
 	httpPort, tlsPort := o.tHTTPPort, o.tTLSPort
 	// REDIRECT rewrites the destination of locally generated packets to loopback, so that is where
 	// the listeners belong. Binding wider would publish an intercepting proxy to the network.
-	httpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", httpPort))
+	httpLns, httpV6, err := loopbackListeners(httpPort)
 	if err != nil {
 		return fmt.Errorf("opening the transparent http port: %w", err)
 	}
-	tlsLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", tlsPort))
+	tlsLns, tlsV6, err := loopbackListeners(tlsPort)
 	if err != nil {
-		httpLn.Close()
+		closeAll(httpLns)
 		return fmt.Errorf("opening the transparent tls port: %w", err)
 	}
-	stopListeners := g.px.serveTransparent(tlsLn, httpLn)
+	stopListeners := g.px.serveTransparent(tlsLns, httpLns)
 	g.cleanup = append(g.cleanup, stopListeners)
 
 	if o.installCA {
@@ -256,7 +256,7 @@ func (g *guardServer) goTransparent(o opts, pol *Policy) error {
 		if o.exempt != "" {
 			exempt = strings.Split(o.exempt, ",")
 		}
-		if err := installRedirect(httpPort, tlsPort, exempt); err != nil {
+		if err := installRedirect(httpPort, tlsPort, exempt, httpV6 && tlsV6); err != nil {
 			return fmt.Errorf("installing the redirect: %w", err)
 		}
 		g.cleanup = append(g.cleanup, func() {
@@ -264,12 +264,96 @@ func (g *guardServer) goTransparent(o opts, pol *Policy) error {
 				errf("could NOT remove the firewall rules — remove them by hand: %s", err)
 			}
 		})
+		logf("the cloud metadata service is filtered like any other host — a policy that needs it " +
+			"must permit it, or pass --exempt 169.254.169.254/32 to leave it alone")
+		sayWhetherThisIsContainment(o)
 	} else {
 		logf("transparent listeners are up on :%d and :%d, but nothing is redirected to them. "+
 			"Pass --redirect, or install the rules yourself.", httpPort, tlsPort)
 	}
 
 	return nil
+}
+
+// loopbackListeners binds one port on both loopback families, reporting whether IPv6 worked.
+//
+// IPv4 is required; IPv6 is not, because plenty of containers genuinely have no ::1. What matters is
+// that the caller LEARNS which it got, so it can decide whether an uncovered family is survivable —
+// see installRedirect, which refuses to run when this host has routable IPv6 and no v6 listener.
+func loopbackListeners(port int) (lns []net.Listener, haveV6 bool, err error) {
+	v4, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, false, err
+	}
+	lns = append(lns, v4)
+
+	v6, err := net.Listen("tcp6", fmt.Sprintf("[::1]:%d", port))
+	if err != nil {
+		logf("no IPv6 loopback listener on :%d (%s)", port, err)
+		return lns, false, nil
+	}
+	return append(lns, v6), true, nil
+}
+
+func closeAll(lns []net.Listener) {
+	for _, ln := range lns {
+		_ = ln.Close()
+	}
+}
+
+// sayWhetherThisIsContainment states, out loud, whether the build can undo what was just installed.
+//
+// The redirect is enforced by the kernel, which means it is enforced against everyone EXCEPT a
+// process holding CAP_NET_ADMIN — and a build running as root in this container holds it. Such a
+// build removes the chain with one command. That is a completely different security property from
+// the one the word "transparent" suggests, and the difference has to be visible in the log rather
+// than inferred from the README.
+func sayWhetherThisIsContainment(o opts) {
+	if os.Geteuid() != 0 {
+		return // not privileged, so the rules came from somewhere else and this is not our claim
+	}
+	switch {
+	case o.wrap && o.runAs != "":
+		// The good case, and the only one that is containment on its own.
+		return
+	case o.wrap:
+		errf("WARNING: the wrapped command inherits this process's privileges, including " +
+			"CAP_NET_ADMIN, so it can undo the redirect with `iptables -t nat -F " + chain + "`. " +
+			"Pass --run-as <user> to start it unprivileged — that drop is what makes this containment.")
+	default:
+		errf("WARNING: this is containment only if the build runs WITHOUT CAP_NET_ADMIN. A build " +
+			"running as root in this container can undo the redirect with `iptables -t nat -F " +
+			chain + "`. Use `serve --wrap --run-as <user> -- <command>` to guarantee it cannot.")
+	}
+}
+
+// resolveRunAs turns --run-as into a credential, or explains why it cannot.
+//
+// Returns exitOK and a nil credential when the flag was not given: running as whoever started us is
+// the ordinary case, and only transparent mode makes it a security question.
+func resolveRunAs(o opts) (*dropCred, int) {
+	if o.runAs == "" {
+		return nil, exitOK
+	}
+	if !o.wrap {
+		errf("--run-as applies to the command --wrap starts, and this invocation starts none. " +
+			"Use `serve --wrap --run-as <user> -- <command>`.")
+		return nil, exitUsage
+	}
+	if !credentialsSupported() {
+		errf("--run-as needs a Unix host: there is no setuid here to drop with")
+		return nil, exitUsage
+	}
+	cred, err := resolveDropUser(o.runAs)
+	if err != nil {
+		errf("%s", err)
+		return nil, exitUsage
+	}
+	if os.Geteuid() != 0 {
+		errf("--run-as needs root: only a privileged process can start a command as another user")
+		return nil, exitUsage
+	}
+	return cred, exitOK
 }
 
 func isLoopback(addr string) bool {
@@ -316,6 +400,14 @@ func runServeCommand(o opts, argv []string) int {
 		errf("--detach and --wrap are mutually exclusive: one backgrounds the proxy, the other " +
 			"keeps it in the foreground around a command")
 		return exitUsage
+	}
+
+	// Resolved before anything is installed. A --run-as that turns out to be unusable should fail
+	// while the machine is still untouched, not after the firewall and the trust store have been
+	// changed and the only remaining question is how cleanly we can put them back.
+	cred, code := resolveRunAs(o)
+	if code != exitOK {
+		return code
 	}
 
 	stateDir := o.stateDir
@@ -380,7 +472,11 @@ func runServeCommand(o opts, argv []string) int {
 
 	if o.wrap {
 		defer g.stop()
-		code, err := runChild(argv, proxyEnv(g.proxyURL, g.caPath))
+		if cred != nil {
+			logf("running the command as %s — it inherits this network namespace but not the "+
+				"capability to change it", cred)
+		}
+		code, err := runChild(argv, proxyEnv(g.proxyURL, g.caPath), cred)
 		if err != nil {
 			errf("%s", err)
 		}

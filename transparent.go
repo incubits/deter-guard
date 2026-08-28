@@ -134,37 +134,53 @@ func (p *proxy) transparentHTTP() http.Handler {
 	})
 }
 
-// serveTransparent runs both redirected listeners until the returned stop function is called.
+// serveTransparent runs the redirected listeners until the returned stop function is called.
 //
 // Two ports rather than one: what arrives on 443 is a TLS record and what arrives on 80 is a request
 // line, and sniffing which is which per connection buys nothing when the kernel already knows.
-func (p *proxy) serveTransparent(tlsLn, httpLn net.Listener) (stop func()) {
-	httpSrv := &http.Server{Handler: p.transparentHTTP()}
-	go func() {
-		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logf("transparent http listener stopped: %s", err)
-		}
-	}()
+//
+// Several listeners per port, because one port has to be served on both loopback families. An
+// IPv6 REDIRECT delivers to ::1 and an IPv4 one to 127.0.0.1; a guard listening on only the second
+// would have the kernel handing it traffic it never accepts, which fails as a connection refused in
+// the middle of a build rather than as anything resembling a policy decision.
+func (p *proxy) serveTransparent(tlsLns, httpLns []net.Listener) (stop func()) {
+	// A redirected port is reachable by anything on the box, so a client that opens a connection and
+	// then says nothing must not be able to hold a goroutine indefinitely.
+	httpSrv := &http.Server{
+		Handler:           p.transparentHTTP(),
+		ReadHeaderTimeout: transparentHandshakeTimeout,
+	}
+	for _, ln := range httpLns {
+		go func(ln net.Listener) {
+			if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logf("transparent http listener stopped: %s", err)
+			}
+		}(ln)
+	}
 
 	done := make(chan struct{})
-	go func() {
-		for {
-			conn, err := tlsLn.Accept()
-			if err != nil {
-				select {
-				case <-done:
-				default:
-					logf("transparent tls listener stopped: %s", err)
+	for _, ln := range tlsLns {
+		go func(ln net.Listener) {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					select {
+					case <-done:
+					default:
+						logf("transparent tls listener stopped: %s", err)
+					}
+					return
 				}
-				return
+				go p.serveTransparentTLS(conn)
 			}
-			go p.serveTransparentTLS(conn)
-		}
-	}()
+		}(ln)
+	}
 
 	return func() {
 		close(done)
-		_ = tlsLn.Close()
+		for _, ln := range tlsLns {
+			_ = ln.Close()
+		}
 		_ = httpSrv.Close()
 	}
 }
