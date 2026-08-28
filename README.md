@@ -244,13 +244,14 @@ Two things the action does that you now have to do yourself:
 
 | Command | |
 | --- | --- |
+| `deter-guard claim` | Finish claiming an organization: prove to the console who owns this pipeline. Fails unless the platform itself signed the identity. |
 | `deter-guard whoami` | What this pipeline authenticates as. Run it first when something's wrong. |
 | `deter-guard policy` | Fetch, verify, and write the Cedar policy. `--out <path>`, or stdout. |
 | `deter-guard exec -- <cmd>` | Run `<cmd>` behind the proxy. Exit code passes straight through. |
 | `deter-guard serve` | Run the proxy on its own, so many commands sit behind one. |
 | `deter-guard env` | Print the variables that point a build at a running proxy. |
 
-`--json` on `whoami` and `policy` for machine-readable output.
+`--json` on `claim`, `whoami` and `policy` for machine-readable output.
 
 <details>
 <summary><b>Options</b></summary>
