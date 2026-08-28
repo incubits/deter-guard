@@ -7,14 +7,14 @@
 
 'use strict'
 
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 
-const GUARD_REPO = 'incubits/deter-guard'
-
 // See inputs.js for why these are a separate, tested module rather than two lines inlined here.
 const inputs = require('./inputs.js')
+// Shared with the claim action, so the two cannot disagree about how the binary is obtained.
+const { fetchGuard, run } = require('./image.js')
 
 const input = (name) => inputs.input(process.env, name)
 const bool = (name) => inputs.bool(process.env, name)
@@ -28,10 +28,6 @@ function fail(msg) {
   // only in the step log.
   process.stdout.write(`::error title=deter-guard::${msg}\n`)
   process.exit(1)
-}
-
-function run(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], ...opts })
 }
 
 function main() {
@@ -51,43 +47,18 @@ function main() {
   const stateDir = path.join(temp, 'deter-guard')
   const binDir = path.join(temp, 'deter-guard-bin')
   fs.mkdirSync(stateDir, { recursive: true })
-  fs.mkdirSync(binDir, { recursive: true })
 
   // Not `input('image')`: unset means "the image built from the same commit as this action", which
   // is what makes pinning the action a real pin. See inputs.js.
   const image = inputs.imageFor(process.env)
   const token = input('token')
-  const guard = path.join(binDir, 'deter-guard')
 
-  log(`::group::deter-guard: fetching ${image}`)
+  let guard
   try {
-    if (token) {
-      execFileSync('docker', ['login', 'ghcr.io', '-u', process.env.GITHUB_ACTOR || 'x', '--password-stdin'],
-        { input: token, stdio: ['pipe', 'inherit', 'inherit'] })
-    }
-    run('docker', ['pull', '--quiet', image], { stdio: ['ignore', 'inherit', 'inherit'] })
-
-    if (bool('verify-attestation')) {
-      // Prove the image was built by the guard repository's own workflow rather than pushed from
-      // somebody's laptop. This is the command we tell customers to run; running it here means a
-      // break in it is our problem before it is theirs.
-      run('gh', ['attestation', 'verify', `oci://${image}`, '--repo', GUARD_REPO],
-        { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, GH_TOKEN: token } })
-    } else {
-      log('::warning title=deter-guard::attestation verification is disabled')
-    }
-
-    // A scratch image has no shell, so it cannot be a job container. Lift the single static binary
-    // out onto the runner, which is also the shape `serve` needs — it has to sit alongside the
-    // build tooling, not in a container of its own.
-    const cid = run('docker', ['create', image]).trim()
-    run('docker', ['cp', `${cid}:/deter-guard`, guard])
-    spawnSync('docker', ['rm', '--volumes', cid], { stdio: 'ignore' })
-    fs.chmodSync(guard, 0o755)
+    guard = fetchGuard({ image, token, verifyAttestation: bool('verify-attestation'), binDir, log })
   } catch (err) {
     fail(`could not obtain the guard from ${image}: ${err.message}`)
   }
-  log('::endgroup::')
 
   const env = { ...process.env }
   if (consoleURL) env.DETER_CONSOLE_URL = consoleURL

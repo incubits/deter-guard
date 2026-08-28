@@ -1,0 +1,68 @@
+# Finishing a claim, in one step.
+#
+#   - uses: incubits/deter-guard/claim@v1
+#
+# That really is the whole job, for the hosted console. It is the first thing a new customer runs, so
+# every input it could have has a default that is right for them: the console URL, the image, and
+# whether to check the image's provenance.
+#
+# Separate from the action one directory up rather than a `claim: true` input on it, because the two
+# do genuinely different things. That one starts a proxy and hands the rest of the job to it, so it
+# needs a `post:` step to tear the proxy down and flush the refusal report. This one runs a single
+# command, prints what the console said, and is finished — no proxy, no teardown, nothing to leak if
+# the job is cancelled. Folding them together would mean a boolean that silently disables half the
+# fields, which is how an action ends up with inputs nobody can tell apart.
+#
+# It is also the wrong command that made this necessary: the claim step used to run `policy`, which
+# fetches the signed bundle — and an organization being claimed has not published one, so it 404'd
+# and failed the job moments after the claim it had just settled succeeded.
+name: deter-guard claim
+description: Prove which organization owns this pipeline. One run finishes claiming it in the console.
+author: incubits
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  console:
+    description: >-
+      Console base URL. Defaults to the hosted console; set it if you run your own.
+    required: false
+    default: https://console.deter.dev
+  audience:
+    description: >-
+      OIDC audience, if your console runs a non-default one. The console's own claim instructions
+      say so when it does.
+    required: false
+    default: ""
+  project:
+    description: Project id, for a dtrc_ token. Ignored when OIDC is available.
+    required: false
+    default: ""
+  run-id:
+    description: >-
+      Run id. Usage is deduplicated on this, so a re-run stays one counted run. Defaults to the
+      workflow run id.
+    required: false
+    default: ""
+  image:
+    description: >-
+      The guard image to take the binary from. Leave unset: the default is the image built from the
+      same commit as this action, so `@v1.2.3` pins the binary as well as the YAML.
+    required: false
+    default: ""
+  verify-attestation:
+    description: >-
+      Verify the image's build provenance before using it. Turn this off only if you have another
+      way to establish where the binary came from.
+    required: false
+    default: "true"
+  token:
+    description: Token used to pull the image and verify its attestation.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: node24
+  main: claim.js
