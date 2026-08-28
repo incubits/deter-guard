@@ -51,7 +51,7 @@ func transparentFixture(t *testing.T, p *Policy, origin *httptest.Server) (tlsAd
 	if err != nil {
 		t.Fatal(err)
 	}
-	stop := px.serveTransparent(tlsLn, httpLn)
+	stop := px.serveTransparent([]net.Listener{tlsLn}, []net.Listener{httpLn})
 	t.Cleanup(stop)
 
 	return tlsLn.Addr().String(), httpLn.Addr().String(), px

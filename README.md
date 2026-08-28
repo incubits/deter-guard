@@ -281,8 +281,20 @@ Two things the action does that you now have to do yourself:
 | `--redirect` | Install the `iptables` rules that send outbound :80/:443 here. |
 | `--install-ca` | Trust the guard's CA system-wide, so intercepted TLS verifies. |
 | `--no-ci-hosts` | Also enforce the policy against this runner's own control plane. |
-| `--exempt <cidrs>` | Comma-separated CIDRs never to intercept. |
+| `--run-as <user>` | Run the `--wrap` command as this user, so it cannot undo the redirect. `user`, `uid`, or `user:group`. |
+| `--exempt <cidrs>` | Comma-separated CIDRs never to intercept. IPv4 and IPv6 both. |
 | `--transparent-http-port <n>` / `--transparent-tls-port <n>` | Default `3129` / `3130`. |
+
+Transparent mode covers **IPv4 and IPv6**. An IPv4-only chain is not partial coverage on a
+dual-stack runner — any host with a `AAAA` record is reached over IPv6 and never touches a rule the
+guard wrote. If this host has routable IPv6 and the `ip6tables` chain cannot be installed, the guard
+**refuses to start** rather than enforce a policy with a silent hole in it.
+
+The **cloud metadata service is filtered like any other host.** `169.254.169.254` serves instance
+credentials over plain HTTP, which makes it the highest-value destination on a CI runner and exactly
+the one an egress policy should have an opinion about, so it is subject to default deny. A runner
+that genuinely needs it either permits it in policy or passes
+`--exempt 169.254.169.254/32`.
 
 **`env`**
 
@@ -357,11 +369,20 @@ around:
 | 1 | Wrap each command — `exec` | yes, by not using the proxy |
 | 2 | One proxy, many commands — `serve` | yes, by ignoring the variables |
 | 3 | A sidecar that owns the network | no, if it has no other route |
-| 4 | `--transparent` in one container | no |
+| 4 | `--transparent --run-as <user>` in one container | no |
+| 4b | `--transparent` with a root build | **yes** — the build can flush the rules |
 
 **Shapes 1 and 2 are filtering, not containment** — don't describe them to an auditor as
 containment. Shape 4 is usually the right answer: it gets shape 3's property inside a single
 container, at the cost of needing Linux and root.
+
+**Shape 4 is only containment if the build is unprivileged.** The redirect is enforced by the
+kernel, which enforces it against everyone except a process holding `CAP_NET_ADMIN` — and a build
+running as root in that container holds it, so `iptables -t nat -F DETER_GUARD` is all it takes.
+`serve --wrap --run-as <user> -- <command>` starts the guard as root and the build as somebody else:
+the build inherits the network namespace, so the rules apply to it, but not the capability, so it
+cannot remove them. That drop *is* the control. Without `--run-as` the guard says so at startup
+rather than implying a containment it is not providing.
 
 <details>
 <summary><b>All four, with Dockerfiles</b></summary>
@@ -464,6 +485,7 @@ process is consulted, so nothing can opt out — shape 3's property without a se
 | `DETER_GUARD_ADDR` | `--addr` | `serve` listen address. Default `127.0.0.1`. |
 | `DETER_GUARD_PORT` | `--port` | `serve` listen port. Default `3128`. |
 | `DETER_GUARD_CA_OUT` | `--ca-out` | Where `serve` writes the CA, and leaves it. |
+| `DETER_RUN_AS` | `--run-as` | Run the `--wrap` command as this user. Transparent mode's containment depends on it. |
 | `DETER_GUARD_ROOTS` | | Roots for the guard's *own* TLS: `both` (default), `system`, `embedded`. |
 
 **Credentials are tried in order:** `DETER_ID_TOKEN` → GitHub Actions OIDC → `DETER_CI_TOKEN`. If the

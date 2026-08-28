@@ -1,8 +1,10 @@
 # TODO
 
-Findings from a review of `main` that are not yet fixed. The two egress bypasses that came out of
-the same review — the `Host` header defeating wildcard rules, and non-canonical paths walking past
-the blocklist — are fixed in `canonical.go` and are not repeated here.
+Findings from a review of `main` that are not yet fixed. Two rounds of fixes are not repeated here:
+the egress bypasses from the first review — the `Host` header defeating wildcard rules, and
+non-canonical paths walking past the blocklist — are fixed in `canonical.go`; the transparent-mode
+findings from the second — IPv6 going uncovered, cloud metadata exempted from filtering, and shape 4
+claiming a containment it did not provide — are fixed in `redirect.go` and `dropprivs.go`.
 
 Ordered by what it costs to be wrong about them, not by effort.
 
@@ -105,18 +107,32 @@ policy file that verified. Write to a temp file in the same directory and rename
 - `.dockerignore` does not exclude `.claude/`.
 - CI runs `go test` without `-race`.
 
-## Not yet reviewed
+## Still open from the transparent-mode review
 
-The review that produced this list started against the `go-egress-proxy` branch, which is several
-PRs behind `main`. Everything above was re-confirmed against `main`, but these files arrived after
-that branch and have **not** been read:
+These came out of reading `serve.go`, `transparent.go`, `envcmd.go`, `installca.go`,
+`redirect_*.go`, `roots.go` and `action/`. Every file listed there has now been read.
 
-- `serve.go`, `serve_test.go`
-- `transparent.go` (only its two policy check sites were touched by the canonicalisation fix)
-- `envcmd.go`, `installca.go`
-- `redirect_linux.go`, `redirect_other.go`
-- `roots.go`, `roots.pem`
-- `action.yml` and `action/`
+### The auto-permitted CI control plane is a broad exfil channel
 
-`redirect_linux.go` and `installca.go` are the ones to look at first: they are the two that hold
-privileges.
+`ciControlPlaneHosts()` appends rules with `PathPrefixes: ["/"]` — any method, any path — for
+`github.com`, `api.github.com`, `objects.githubusercontent.com` and `*.blob.core.windows.net`. The
+last is general-purpose Azure blob storage, so a malicious postinstall has a permitted write target.
+The trade is sound and `--no-ci-hosts` turns it off; it belongs in the README's limits list next to
+the DNS caveat, because it is the same shape of hole.
+
+### `installca.go` has a trust store entry that can never match
+
+The third entry (Alpine) is byte-identical to the first: same directory, same file, same refresh
+command. And the "no system trust store found" error hardcodes `trustStores[0]` and `[1]`, so it
+goes stale as soon as the list grows a fourth.
+
+### `DETER_GUARD_ROOTS=system` does not fail the way its comment says
+
+The comment is emphatic that there is no fallback — the operator asked for the host's trust
+decisions specifically. But a failed `SystemCertPool()` returns a nil pool, and a nil `RootCAs` means
+Go loads the platform store anyway. On Linux that is a silent fallback to roughly what was refused.
+
+### Nothing fails when `roots.pem` ages
+
+Currently Mozilla's set as of 13 Aug 2026, which is fresh. There is no test and no scheduled refresh,
+so it rots quietly and the first symptom is a handshake failure against a newly-issued root.

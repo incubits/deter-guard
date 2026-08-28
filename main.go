@@ -80,6 +80,7 @@ type opts struct {
 	tHTTPPort   int
 	tTLSPort    int
 	exempt      string
+	runAs       string
 	// env only
 	format   string
 	proxyURL string
@@ -125,7 +126,10 @@ transparent mode (Linux, needs root — nothing has to opt in, and nothing can o
   --no-ci-hosts      Also enforce the policy against this runner's OWN control plane
                      (default: those hosts are permitted, so a bad policy cannot stop
                       the job reporting that it was a bad policy)
-  --exempt <cidrs>   Comma-separated CIDRs never to intercept
+  --exempt <cidrs>   Comma-separated CIDRs never to intercept. Cloud metadata
+                     (169.254.169.254) is filtered by policy unless named here
+  --run-as <user>    Run the --wrap command as this user, so it CANNOT undo the
+                     redirect. Without it, a root build can (env DETER_RUN_AS)
   --transparent-http-port <n>   default 3129
   --transparent-tls-port  <n>   default 3130
 
@@ -255,6 +259,7 @@ func run() int {
 	fs.IntVar(&o.tHTTPPort, "transparent-http-port", defaultTransparentHTTPPort, "")
 	fs.IntVar(&o.tTLSPort, "transparent-tls-port", defaultTransparentTLSPort, "")
 	fs.StringVar(&o.exempt, "exempt", "", "")
+	fs.StringVar(&o.runAs, "run-as", env("DETER_RUN_AS", ""), "")
 	fs.StringVar(&o.format, "format", "sh", "")
 	fs.StringVar(&o.proxyURL, "proxy", "", "")
 	fs.StringVar(&o.caPath, "ca", "", "")

@@ -87,16 +87,20 @@ func runExec(o execOpts) (int, error) {
 	// Shuts the proxy down first so nothing new is recorded, then flushes what was.
 	defer g.stop()
 
-	return runChild(o.argv, proxyEnv(g.proxyURL, g.caPath))
+	return runChild(o.argv, proxyEnv(g.proxyURL, g.caPath), nil)
 }
 
 // runChild execs the command, wiring through stdio and forwarding signals, and returns its exit code.
-func runChild(argv []string, extraEnv []string) (int, error) {
+//
+// cred, when set, is the identity to start the command as — see dropprivs.go. nil means "whoever we
+// are", which is the right answer everywhere except transparent mode.
+func runChild(argv []string, extraEnv []string, cred *dropCred) (int, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), extraEnv...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	applyCredential(cmd, cred)
 
 	if err := cmd.Start(); err != nil {
 		return exitUsage, fmt.Errorf("could not start %s: %w", argv[0], err)
