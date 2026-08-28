@@ -1,5 +1,6 @@
 // deter-guard — what a CI job runs to get its organization's signed egress policy.
 //
+//	deter-guard claim      prove to the console who owns this pipeline
 //	deter-guard whoami     what this pipeline authenticates as
 //	deter-guard policy     fetch + VERIFY the signed policy, write it to a file
 //	deter-guard exec       run ONE command behind the filtering proxy
@@ -91,6 +92,7 @@ type opts struct {
 const usage = `deter-guard — fetch, verify and ENFORCE this organization's signed egress policy
 
 Usage:
+  deter-guard claim  [options]
   deter-guard whoami [options]
   deter-guard policy [options]
   deter-guard exec   [options] -- <command...>
@@ -221,7 +223,7 @@ func run() int {
 		return exitOK
 	}
 	switch cmd {
-	case "whoami", "policy", "exec", "serve", "env":
+	case "claim", "whoami", "policy", "exec", "serve", "env":
 	default:
 		errf("unknown command %q", cmd)
 		fmt.Println(usage)
@@ -316,7 +318,14 @@ func run() int {
 		headers["X-Deter-Run"] = o.run
 	}
 
-	if cmd == "whoami" {
+	// claim and whoami ask the console the same question and differ in what they do with the answer.
+	// whoami is a diagnostic: it reports whatever you turned out to be, self-reported identity
+	// included, because when something is wrong that is exactly what you need to see. claim is an
+	// assertion — it is what finishes claiming an organization, so an identity the PLATFORM did not
+	// sign is a failure rather than a line of output. A claim settled by a token somebody pasted into
+	// a variable would prove nothing about who owns the organization, which is the one thing it
+	// exists to establish.
+	if cmd == "claim" || cmd == "whoami" {
 		me, err := fetchWhoAmI(ctx, o.consoleURL, token, headers)
 		if err != nil {
 			errf("%s", err)
@@ -329,11 +338,25 @@ func run() int {
 		if o.asJSON {
 			b, _ := json.MarshalIndent(me, "", "  ")
 			fmt.Println(string(b))
+			if cmd == "claim" && !me.Attested {
+				return exitAuth
+			}
 			return exitOK
 		}
 		name := me.ProjectPath
 		if name == "" {
 			name = me.ProjectRef
+		}
+		if cmd == "claim" {
+			out, code := claimReport(me, how)
+			w := os.Stdout
+			if code != exitOK {
+				w = os.Stderr
+			}
+			for _, line := range out {
+				fmt.Fprintln(w, line)
+			}
+			return code
 		}
 		attested := "no — identity is self-reported"
 		if me.Attested {
@@ -414,4 +437,36 @@ func run() int {
 		}
 	}
 	return exitOK
+}
+
+// claimReport turns what the console said about this run into what to print and what to exit with.
+//
+// Split out from run() because it is the only genuinely new decision `claim` makes, and the rest of
+// that path is network. A pure function of the answer can be tested for the case that matters —
+// refusing to settle a claim on an identity nobody signed — without standing up a console.
+func claimReport(me whoAmI, how string) ([]string, int) {
+	name := me.ProjectPath
+	if name == "" {
+		name = me.ProjectRef
+	}
+	if !me.Attested {
+		// The whole point of settling a claim in CI is that the PLATFORM vouches for the owner. A
+		// dtrc_ token is a string somebody pasted into a variable; honouring it here would mean an
+		// organization could be claimed by anyone who got hold of one.
+		return []string{
+			"deter-guard: this run's identity is self-reported, so it cannot settle a claim.",
+			"deter-guard: a claim has to be finished by a token the platform itself signed — on",
+			"deter-guard: GitHub Actions that means `permissions: id-token: write` on the job,",
+			"deter-guard: not DETER_CI_TOKEN.",
+		}, exitAuth
+	}
+	// Deliberately not "claimed!": this job stays in the repository and runs on every push, and the
+	// console settles the claim on the FIRST attested token — so every run after that one is a
+	// re-confirmation, not a claim. A sentence that is true both times beats a celebration that
+	// becomes a lie from the second push onward.
+	return []string{
+		fmt.Sprintf("verified by %s — this pipeline belongs to organization %s", how, me.OrganizationID),
+		fmt.Sprintf("  project       %s (%s)", name, me.Provider),
+		"if the console still shows this claim as pending, reload it.",
+	}, exitOK
 }

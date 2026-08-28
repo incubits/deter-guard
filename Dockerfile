@@ -2,10 +2,12 @@
 #
 #   docker build -t deter-guard .
 #
-# The runtime stage is FROM scratch. It contains three things: the static binary, a CA bundle so TLS
-# works, and a passwd entry so it can run as a non-root user. No shell, no package manager, no
-# language runtime, nothing to patch. A tool whose job is to stand in front of a supply-chain problem
-# shouldn't bring one along — and the smaller it is, the faster every pipeline run pulls it.
+# The runtime stage is FROM scratch. It contains four things: the static binary, a CA bundle so TLS
+# works, a passwd entry so it can run as a non-root user, and one static busybox providing `sh` and
+# `tail` — see the note on that stage for why a CI image has no choice about those two. No package
+# manager, no language runtime, nothing that resolves a dependency at run time. A tool whose job is
+# to stand in front of a supply-chain problem shouldn't bring one along — and the smaller it is, the
+# faster every pipeline run pulls it.
 #
 # The binary is CGO_ENABLED=0 static, so it needs no libc at all.
 
@@ -42,11 +44,48 @@ RUN apk add --no-cache ca-certificates
 # anything that looks it up complains, and one line is cheaper than explaining that later.
 RUN echo 'deter:x:65532:65532:deter:/:/sbin/nologin' > /passwd.min
 
+# ---- a shell, because a CI job image is not run the way you run it -----------------------------
+# Both platforms start a job image THEMSELVES rather than running its entrypoint. GitHub Actions
+# creates the container with `--entrypoint tail <image> -f /dev/null` and then execs every step
+# through `sh`; GitLab hands its `script:` to `sh` the same way. A pure-scratch image satisfies
+# neither, and the failure lands before the first step as
+#
+#   OCI runtime create failed: exec: "tail": executable file not found in $PATH
+#
+# which reads like a broken runner rather than a missing shell, and cost us a customer-visible
+# afternoon. Our own console tells people to use this image as their job image; the image has to be
+# able to be one.
+#
+# This is the smallest way to do that: ONE static uclibc busybox (~1 MB) with two names hung off it.
+# Nothing here can be upgraded in place, nothing resolves a dependency at run time, and there is
+# still no package manager — which is the property "no shell" was standing in for. A shell that is a
+# symlink to a single pinned static binary is not a supply chain.
+FROM docker.io/library/busybox:1.37.0-uclibc AS shell
+# Only the two names the runners actually invoke. Every other applet is reachable as
+# `busybox <applet>`, so this is a smaller surface than a distro shell without being a smaller
+# binary — the cost is the same either way, and the PATH stays honest about what is here.
+#
+# The third name is the guard itself. As an ENTRYPOINT the absolute path is enough, but a job
+# container is started with the entrypoint REPLACED, and every step then says `deter-guard claim` —
+# a bare name, resolved against PATH. Without this the image gets a shell and still fails, one step
+# later, with `deter-guard: not found`.
+RUN mkdir -p /min/bin \
+ && ln -s /bin/busybox /min/bin/sh \
+ && ln -s /bin/busybox /min/bin/tail \
+ && ln -s /deter-guard  /min/bin/deter-guard
+
 # ---- runtime --------------------------------------------------------------------------------
 FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=certs /passwd.min /etc/passwd
+COPY --from=shell /bin/busybox /bin/busybox
+COPY --from=shell /min/bin/ /bin/
 COPY --from=build /out/deter-guard /deter-guard
+
+# scratch carries no PATH, so every consumer would depend on the runtime's built-in default to find
+# `sh` and `tail`. Spelling it out costs one line and removes that dependency; it is also what
+# `exec` mode resolves the wrapped command against.
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Never root. A CI runner is exactly where that matters, and nothing in here needs it.
 USER 65532:65532
