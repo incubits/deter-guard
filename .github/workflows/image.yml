@@ -188,6 +188,10 @@ jobs:
       # Named explicitly rather than `--test action/`, because the runner would otherwise execute
       # main.js, which is a program and not a test.
       - run: node --test action/inputs.test.js
+      # The claim action reaches up a directory for the modules it shares with the main one,
+      # and the console publishes a snippet that relies on its `console` default. Neither is
+      # exercised by anything else here.
+      - run: node --test claim/action.test.js
 
       # The rules that decide whether a release may happen at all. Wrong quietly, if wrong.
       - run: node --test ci/semantic.test.js

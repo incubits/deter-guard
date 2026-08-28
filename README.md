@@ -244,7 +244,7 @@ Two things the action does that you now have to do yourself:
 
 | Command | |
 | --- | --- |
-| `deter-guard claim` | Finish claiming an organization: prove to the console who owns this pipeline. Fails unless the platform itself signed the identity. |
+| `deter-guard claim` | Finish claiming an organization: prove to the console who owns this pipeline. Fails unless the platform itself signed the identity. On GitHub Actions use `uses: incubits/deter-guard/claim@v1` instead — it needs no inputs at all against the hosted console. |
 | `deter-guard whoami` | What this pipeline authenticates as. Run it first when something's wrong. |
 | `deter-guard policy` | Fetch, verify, and write the Cedar policy. `--out <path>`, or stdout. |
 | `deter-guard exec -- <cmd>` | Run `<cmd>` behind the proxy. Exit code passes straight through. |
