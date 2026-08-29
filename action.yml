@@ -2,7 +2,7 @@
 #
 #   - uses: incubits/deter-guard@v1
 #     with:
-#       console: ${{ vars.DETER_CONSOLE_URL }}
+#       console: https://console.deter.dev
 #       pubkey:  ${{ vars.DETER_POLICY_PUBKEY }}
 #   - run: pnpm install          # guarded. no prefix, no environment to wire up.
 #
