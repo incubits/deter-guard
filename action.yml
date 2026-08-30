@@ -26,9 +26,10 @@ branding:
 inputs:
   console:
     description: >-
-      Console base URL, e.g. https://deter-console.fly.dev. Required unless `policy` is given.
+      Console base URL. Defaults to the hosted console; set it if you run your own. Ignored when
+      `policy` is given.
     required: false
-    default: ""
+    default: https://console.deter.dev
   pubkey:
     description: >-
       Pin the policy signing key (hex). Strongly recommended: without it the guard verifies the

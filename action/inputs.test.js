@@ -6,6 +6,8 @@
 
 const { test } = require('node:test')
 const assert = require('node:assert')
+const fs = require('node:fs')
+const path = require('node:path')
 const { input, bool, imageTag, imageFor, IMAGE_REPO } = require('./inputs.js')
 
 test('a hyphenated input keeps its hyphen in the env var name', () => {
@@ -92,4 +94,13 @@ test('only affirmative spellings are true', () => {
   for (const v of ['false', 'FALSE', '0', 'no', '', 'maybe', 'null']) {
     assert.equal(bool({ INPUT_T: v }, 't'), false, `${v} should be false`)
   }
+})
+
+test('the console input defaults to the hosted console, so the snippet needs only a pubkey', () => {
+  // The shortest form we publish — and the one this repository's own pipeline uses — carries no
+  // `console`. That is only correct while this is the default, and getting it wrong would point
+  // every such job at the wrong console rather than fail loudly.
+  const actionYml = fs.readFileSync(path.join(__dirname, '..', 'action.yml'), 'utf8')
+  assert.match(actionYml, /default:\s*https:\/\/console\.deter\.dev/,
+    'a job with no `console` input relies on this default')
 })
