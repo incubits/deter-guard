@@ -8,7 +8,7 @@ const { test } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const path = require('node:path')
-const { input, bool, imageTag, imageFor, IMAGE_REPO } = require('./inputs.js')
+const { input, bool, imageTag, imageFor, consoleURL, IMAGE_REPO, DEFAULT_CONSOLE } = require('./inputs.js')
 
 test('a hyphenated input keeps its hyphen in the env var name', () => {
   // The regression. GitHub sets INPUT_VERIFY-ATTESTATION; reading INPUT_VERIFY_ATTESTATION finds
@@ -96,11 +96,27 @@ test('only affirmative spellings are true', () => {
   }
 })
 
-test('the console input defaults to the hosted console, so the snippet needs only a pubkey', () => {
-  // The shortest form we publish — and the one this repository's own pipeline uses — carries no
-  // `console`. That is only correct while this is the default, and getting it wrong would point
-  // every such job at the wrong console rather than fail loudly.
-  const actionYml = fs.readFileSync(path.join(__dirname, '..', 'action.yml'), 'utf8')
-  assert.match(actionYml, /default:\s*https:\/\/console\.deter\.dev/,
-    'a job with no `console` input relies on this default')
+test('a job with no console input falls back rather than failing', () => {
+  // The regression, and it cost this repository its own pipeline: relying on action.yml's `default:`
+  // means the value comes from the version the caller RESOLVED. A job pinned to a tag older than the
+  // default got "set `console` to your deter console URL" and could only be fixed by releasing —
+  // which the guarded pipeline could no longer do.
+  assert.equal(consoleURL({}), DEFAULT_CONSOLE)
+  assert.equal(consoleURL({ INPUT_CONSOLE: '' }), DEFAULT_CONSOLE)
+  assert.equal(consoleURL({ INPUT_CONSOLE: '   ' }), DEFAULT_CONSOLE)
+})
+
+test('an explicit console input wins over the fallback', () => {
+  assert.equal(consoleURL({ INPUT_CONSOLE: 'https://console.internal' }), 'https://console.internal')
+})
+
+test('both action.yml defaults agree with the constant in code', () => {
+  // Two sources for one value. They may both exist — the YAML default is what a reader of the
+  // action's documentation sees — but they must never disagree, or the console a job talks to
+  // depends on which of the two happened to apply.
+  for (const rel of [['..', 'action.yml'], ['..', 'claim', 'action.yml']]) {
+    const yml = fs.readFileSync(path.join(__dirname, ...rel), 'utf8')
+    const declared = (yml.match(/^\s*default:\s*(https:\/\/\S+)\s*$/m) || [])[1]
+    assert.equal(declared, DEFAULT_CONSOLE, `${rel.join('/')} declares a different console`)
+  }
 })

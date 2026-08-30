@@ -28,11 +28,9 @@ function fail(msg, code = 1) {
 }
 
 function main() {
-  const consoleURL = input('console')
-  if (!consoleURL) {
-    // Only reachable if someone passed `console: ""` explicitly, since the input has a default.
-    fail('set `console` to your deter console URL, or leave it unset for the hosted one')
-  }
+  // Not `input('console')`: the action.yml default only applies to the version a caller resolved,
+  // and this is the first thing a new customer ever runs. See inputs.js.
+  const consoleURL = inputs.consoleURL(process.env)
 
   const temp = process.env.RUNNER_TEMP || process.env.TMPDIR || '/tmp'
   const image = inputs.imageFor(process.env)
