@@ -31,11 +31,11 @@ function fail(msg) {
 }
 
 function main() {
-  const consoleURL = input('console')
   const policyFile = input('policy')
-  if (!consoleURL && !policyFile) {
-    fail('set `console` to your deter console URL, or `policy` to a local policy file')
-  }
+  // `policy` means "enforce this file and talk to nobody", so it does NOT get the fallback: a local
+  // policy configures no reporting, and quietly pointing it at the hosted console would be a
+  // request the caller did not make. Everything else falls back rather than failing.
+  const consoleURL = policyFile ? input('console') : inputs.consoleURL(process.env)
   if (consoleURL && !input('pubkey')) {
     // Not fatal — the guard still verifies — but verifying a bundle against a key from the same
     // response proves only that it is internally consistent. Say so where somebody will see it.

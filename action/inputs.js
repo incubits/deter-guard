@@ -33,6 +33,33 @@ function bool(env, name) {
 const IMAGE_REPO = 'ghcr.io/incubits/deter-guard'
 
 /**
+ * The hosted console — and the value both actions FALL BACK TO, rather than only the `default:` in
+ * action.yml.
+ *
+ * Those are not the same thing, which is the bug this exists to close. A YAML default is supplied by
+ * the resolved version of the action, so `uses: …@v1` gets whatever v1 declared — not what this
+ * working tree declares. The moment a job omits `console` and the tag it pins is older than the
+ * default, the step dies with "set `console` to your deter console URL" and the only fix is to
+ * release. This repository deadlocked its own pipeline exactly that way: the guard blocked the Test
+ * job, Test blocked the image, and the image blocked the release that would have carried the default.
+ *
+ * A fallback in code has neither failure mode. It ships inside the same file that reads the input,
+ * so any version of the action that can read `console` can also do without it.
+ */
+const DEFAULT_CONSOLE = 'https://console.deter.dev'
+
+/**
+ * The console to talk to: what the caller asked for, or the hosted one.
+ *
+ * An input that is present but blank counts as absent — `console: ${{ vars.DETER_CONSOLE_URL }}`
+ * with the variable unset arrives as an empty string, and failing that job on a technicality helps
+ * nobody.
+ */
+function consoleURL(env) {
+  return input(env, 'console') || DEFAULT_CONSOLE
+}
+
+/**
  * The image tag corresponding to a given ref of this action.
  *
  * The action and the image are cut from the same commit by the same workflow, so the default is to
@@ -69,4 +96,4 @@ function imageFor(env) {
   return input(env, 'image') || `${IMAGE_REPO}:${imageTag(env.GITHUB_ACTION_REF)}`
 }
 
-module.exports = { input, bool, imageTag, imageFor, IMAGE_REPO }
+module.exports = { input, bool, imageTag, imageFor, consoleURL, IMAGE_REPO, DEFAULT_CONSOLE }
