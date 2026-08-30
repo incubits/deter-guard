@@ -150,15 +150,23 @@ func TestGlobCrossesSlashes(t *testing.T) {
 
 // --- the proxy, end to end -------------------------------------------------------------------
 
-// proxyClient returns a client that goes through the proxy and trusts its CA, plus the running
-// proxy's URL.
+// startProxy runs an enforcing proxy and returns a client that goes through it and trusts its CA.
 func startProxy(t *testing.T, p *Policy, originRoot *x509.CertPool) (*http.Client, func()) {
+	t.Helper()
+	c, _, stop := startProxyMode(t, p, originRoot, ModeEnforce, nil)
+	return c, stop
+}
+
+// startProxyMode is startProxy with the mode named and the proxy handed back, so a test can read the
+// tally it kept — which is the only way to tell a request that was OBSERVED from one that was never
+// decided at all.
+func startProxyMode(t *testing.T, p *Policy, originRoot *x509.CertPool, mode Mode, rep *reporter) (*http.Client, *proxy, func()) {
 	t.Helper()
 	ca, err := newCertAuthority()
 	if err != nil {
 		t.Fatal(err)
 	}
-	px := newProxy(p, ca, nil, false)
+	px := newProxy(p, ca, rep, mode, false)
 	if originRoot != nil {
 		// The proxy verifies the ORIGIN against real roots in production; a test origin needs its
 		// own. This is the only place that trust is relaxed, and only for the test's own server.
@@ -175,7 +183,7 @@ func startProxy(t *testing.T, p *Policy, originRoot *x509.CertPool) (*http.Clien
 		Proxy:           http.ProxyURL(u),
 		TLSClientConfig: &tls.Config{RootCAs: pool},
 	}}
-	return client, srv.Close
+	return client, px, srv.Close
 }
 
 func get(t *testing.T, c *http.Client, url string) (int, string) {
@@ -321,7 +329,7 @@ func TestARefusedHostIsReportedOncePerTunnelNotPerRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep := &reporter{windows: map[windowKey]*window{}, stop: make(chan struct{}), done: make(chan struct{})}
-	px := newProxy(&Policy{Version: 3, Rules: []Rule{{Host: "somewhere.else.example.com"}}}, ca, rep, false)
+	px := newProxy(&Policy{Version: 3, Rules: []Rule{{Host: "somewhere.else.example.com"}}}, ca, rep, ModeEnforce, false)
 	px.upstream.TLSClientConfig = &tls.Config{RootCAs: originRoot}
 	srv := httptest.NewServer(px)
 	defer srv.Close()
@@ -361,7 +369,7 @@ func TestARefusedHostIsReportedOncePerTunnelNotPerRetry(t *testing.T) {
 
 func TestReporterOnlySeesRefusals(t *testing.T) {
 	r := &reporter{windows: map[windowKey]*window{}, stop: make(chan struct{}), done: make(chan struct{})}
-	px := newProxy(&Policy{Rules: []Rule{{Host: "ok.example.com"}}}, nil, r, false)
+	px := newProxy(&Policy{Rules: []Rule{{Host: "ok.example.com"}}}, nil, r, ModeEnforce, false)
 
 	px.record(Decision{Allow: true, Kind: "allow"}, "ok.example.com", "GET", "/a")
 	px.record(Decision{Kind: "deny_policy", Reason: "no"}, "bad.example.com", "GET", "/b")

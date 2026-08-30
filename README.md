@@ -43,6 +43,10 @@ as annotations on the run summary.
 
 > **First time?** Claim your GitHub organization in the console under
 > **CI protection → Trusted CI owners**. Until you do, the OIDC exchange is refused by design.
+>
+> Then add `mode: monitor` for the first few runs. The job reports what the policy *would* have
+> refused and blocks nothing, so you find out what your build actually talks to without finding out
+> the hard way. See [Monitor first, then enforce](#monitor-first-then-enforce).
 
 ### One command, anywhere
 
@@ -63,6 +67,7 @@ npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3
 | --- | --- | --- |
 | `console` | — | Console base URL. Required unless `policy` is set. |
 | `pubkey` | — | Pin the policy signing key (hex). **Strongly recommended.** |
+| `mode` | `enforce` | `monitor` reports what the policy *would* refuse and blocks nothing. See [Monitor first, then enforce](#monitor-first-then-enforce). |
 | `transparent` | `false` | Intercept at the kernel instead of via proxy variables. See [Modes](#modes). |
 | `policy` | — | Local **unsigned** policy file to enforce instead of fetching one. |
 | `image` | matches the action's own ref | Image to take the binary from. Set it only to pull from a mirror of your own — see [Versions](#versions). |
@@ -119,7 +124,64 @@ where the build is told to trust it, and dies with the job.
 
 ---
 
+## Monitor first, then enforce
+
+```bash
+deter-guard exec --mode monitor -- npm ci
+```
+
+Nobody knows every host their build touches. Transitive installs, a vendored toolchain, one telemetry
+endpoint somebody added in 2019 — and the first pipeline anyone wants a policy on is the one they
+cannot afford to break. Turning enforcement on blind means a red build, an urgent revert, and a
+control that is now switched off. **A policy nobody dares enable protects nothing.**
+
+Monitor mode is the run that produces the list:
+
+| | `--mode monitor` | `--mode enforce` (default) |
+| --- | --- | --- |
+| The decision | made, logged, reported | made, logged, reported |
+| The request | goes through | **403**, never dialled onward |
+| Your build | passes | fails at the first refused fetch |
+
+```
+deter-guard: egress proxy on http://127.0.0.1:52054 · policy version 812 · 4 rule(s), 118 block(s) · mode monitor
+deter-guard: MONITOR MODE: nothing will be blocked. Refusals are logged, reported and summarised at
+the end of the run; the requests are made anyway.
+deter-guard: WOULD-DENY GET telemetry.example.com/v1/events — host not permitted by the egress policy (monitor mode: allowed through)
+...
+deter-guard: MONITOR MODE SUMMARY: 12 request(s) across 3 target(s) WOULD have been refused (431 allowed by the policy). Nothing was blocked:
+deter-guard:        9 × GET registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz — left-pad 1.3.0 is on your organization's blocklist
+deter-guard:        2 × CONNECT telemetry.example.com:443 — host not permitted by the egress policy
+deter-guard:        1 × GET telemetry.example.com/v1/events — host not permitted by the egress policy
+deter-guard: permit whatever belongs in your egress policy, then run with --mode enforce to make
+this real. Until then this job is NOT protected.
+```
+
+The summary is the answer; the per-request lines are lost in forty thousand lines of build output.
+Identical refusals collapse, so a retry loop is one row rather than four hundred, and the list is in
+first-seen order — the first thing refused is usually what caused everything after it.
+
+**It is the same code path, not a simulator.** The policy is consulted, the refusal is built, and the
+only branch is whether the 403 is written or the request is let through. A dry run that
+re-implemented the decision would eventually disagree with the one that enforces, and you would find
+out in the direction of a broken build.
+
+Refusals reach the console either way — the batch carries the mode, so an observation is not counted
+as a block. On GitHub Actions they arrive as **warning** annotations rather than errors: nothing
+failed.
+
+One thing is refused in both modes: a request the guard cannot identify — a malformed authority, an
+undecodable path, a TLS connection with no SNI. There is no host to forward those to.
+
+> **A job in monitor mode is not protected.** It is a measurement, and it looks exactly like a
+> guarded job apart from the one property that matters. Move it to `enforce` once the list is empty.
+
+---
+
 ## Modes
+
+How traffic reaches the guard. Independent of [monitor or enforce](#monitor-first-then-enforce) —
+the two compose, and any combination is valid.
 
 | | Proxy mode | Transparent mode |
 | --- | --- | --- |
@@ -260,6 +322,7 @@ Two things the action does that you now have to do yourself:
 
 | | |
 | --- | --- |
+| `--mode <mode>` | `enforce` (default) refuses. `monitor` decides and reports the same way, and lets the request through. See [Monitor first, then enforce](#monitor-first-then-enforce). |
 | `--policy <path>` | Enforce a local policy file instead of fetching one. **Unsigned** — nothing is verified, and it says so on every run. |
 | `--state-dir <dir>` | Where the CA the build must trust is written. Defaults to a temp dir. |
 | `--verbose` | Log allowed requests too, not just refusals. |
@@ -339,7 +402,9 @@ A real HTTP **403**, delivered inside the TLS session, naming the host and polic
 }
 ```
 
-Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward.
+Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward. Under
+`--mode monitor` this response is never written: the same decision is logged and reported, and the
+request goes through. See [Monitor first, then enforce](#monitor-first-then-enforce).
 
 **The status code is the point.** Refusing at `CONNECT` instead gives the client a *transport* error
 (`UND_ERR_ABORTED`), and every package manager retries those — so a refusal decided in the first
@@ -481,6 +546,7 @@ process is consulted, so nothing can opt out — shape 3's property without a se
 | `DETER_CI_OIDC_AUDIENCE` | `--audience` | Default `deter-console`. Must match the console. |
 | `DETER_PROJECT` | `--project` | Project id, for a `dtrc_` token. |
 | `DETER_RUN_ID` | `--run` | Run id — deduplicates usage across retries. |
+| `DETER_MODE` | `--mode` | `enforce` (default) or `monitor`. |
 | `DETER_POLICY_FILE` | `--policy` | Enforce a local, **unsigned** policy file. |
 | `DETER_STATE_DIR` | `--state-dir` | Where the CA and state file go. |
 | `DETER_GUARD_ADDR` | `--addr` | `serve` listen address. Default `127.0.0.1`. |

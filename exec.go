@@ -60,6 +60,7 @@ type execOpts struct {
 	reporter *reporter
 	// Directory to write the CA into. Must be readable by the child.
 	stateDir string
+	mode     Mode
 	verbose  bool
 	argv     []string
 }
@@ -79,7 +80,7 @@ func runExec(o execOpts) (int, error) {
 
 	// Port 0: let the kernel choose, so two jobs on one runner never collide. The CA is ours to
 	// delete afterwards — nobody outside this process was ever told where it is.
-	g, err := startGuard(o.policy, o.reporter, "127.0.0.1", 0,
+	g, err := startGuard(o.policy, o.reporter, o.mode, "127.0.0.1", 0,
 		filepath.Join(stateDir, "deter-guard-ca.pem"), true, o.verbose)
 	if err != nil {
 		return exitUsage, err
@@ -151,7 +152,7 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 			return nil, nil, exitUsage, err
 		}
 		logf("policy from %s (UNSIGNED — no console, nothing verified)", o.policyFile)
-		warnIfPermitsNothing(p)
+		warnIfPermitsNothing(p, o.mode)
 		return p, nil, exitOK, nil
 	}
 
@@ -200,16 +201,22 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 			"pin --pubkey to make this a real check", p.Version, keyFingerprint(served))
 	}
 
-	warnIfPermitsNothing(p)
-	return p, newReporter(baseURL(o.consoleURL)+"/api/report/attempts", token, headers), exitOK, nil
+	warnIfPermitsNothing(p, o.mode)
+	rep := newReporter(baseURL(o.consoleURL)+"/api/report/attempts", token, headers, o.mode)
+	return p, rep, exitOK, nil
 }
 
 // warnIfPermitsNothing names the one policy that is valid, blocks everything, and looks like a bug.
 //
 // The only symptom otherwise is a build that fails at its first fetch, which reads as "the proxy is
 // broken" rather than "the policy is empty".
-func warnIfPermitsNothing(p *Policy) {
+func warnIfPermitsNothing(p *Policy, mode Mode) {
 	if len(p.Rules) == 0 {
+		if mode == ModeMonitor {
+			errf("this policy permits NO hosts — every request would be refused under `--mode " +
+				"enforce`. Nothing is blocked in monitor mode, so this run will list the lot")
+			return
+		}
 		errf("this policy permits NO hosts — every request will be refused")
 	}
 }
@@ -231,6 +238,7 @@ func runExecCommand(o opts, argv []string) int {
 		policy:   pol,
 		reporter: rep,
 		stateDir: o.stateDir,
+		mode:     o.mode,
 		verbose:  o.verbose,
 		argv:     argv,
 	})

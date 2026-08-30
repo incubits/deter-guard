@@ -66,6 +66,13 @@ type Decision struct {
 	// broker's audit vocabulary so the two look the same in the console.
 	Kind   string
 	Reason string
+	// Malformed marks a request the guard could not identify a destination for: an authority that is
+	// not a host, a path that will not decode, a TLS connection with no SNI.
+	//
+	// It exists because monitor mode (see mode.go) lets a refused request through, and this is the
+	// one refusal it must not — there is nothing to let it through TO. Kept off the wire vocabulary
+	// deliberately: to the console this is still a `deny_policy`, because that is what it is.
+	Malformed bool
 }
 
 // hostMatches supports an exact name and a leading-`*.` wildcard.

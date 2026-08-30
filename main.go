@@ -66,6 +66,10 @@ type opts struct {
 	policyFile string
 	stateDir   string
 	verbose    bool
+	// What a refusal does. modeName is the raw flag; mode is it parsed, and is what everything else
+	// reads — see mode.go.
+	modeName string
+	mode     Mode
 	// serve only
 	addr      string
 	port      int
@@ -109,6 +113,8 @@ Options:
   --json             Machine-readable output
 
 exec and serve options:
+  --mode <mode>      monitor: report what WOULD be refused, block nothing    (env DETER_MODE)
+                     enforce: refuse it, the default
   --policy <path>    Use a local policy file instead of the console (UNSIGNED)
   --state-dir <dir>  Where the CA and state file go (env DETER_STATE_DIR, default: temp dir)
   --verbose          Log allowed requests too, not just refusals
@@ -247,6 +253,7 @@ func run() int {
 	fs.BoolVar(&o.asJSON, "json", false, "")
 	fs.StringVar(&o.policyFile, "policy", env("DETER_POLICY_FILE", ""), "")
 	fs.StringVar(&o.stateDir, "state-dir", env("DETER_STATE_DIR", ""), "")
+	fs.StringVar(&o.modeName, "mode", env("DETER_MODE", ""), "")
 	fs.BoolVar(&o.verbose, "verbose", false, "")
 	fs.StringVar(&o.addr, "addr", env("DETER_GUARD_ADDR", "127.0.0.1"), "")
 	fs.IntVar(&o.port, "port", envInt("DETER_GUARD_PORT", defaultProxyPort), "")
@@ -269,6 +276,15 @@ func run() int {
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return exitUsage
 	}
+
+	// Parsed before anything is fetched or installed: a mode nobody can read is a configuration
+	// mistake, and finding out after the policy is on disk and the firewall is rewritten is late.
+	m, err := parseMode(o.modeName)
+	if err != nil {
+		errf("%s", err)
+		return exitUsage
+	}
+	o.mode = m
 
 	// These three resolve their own policy (or need none), so they run before the block below that
 	// insists on a console URL.

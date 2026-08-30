@@ -88,15 +88,28 @@ function reportRefusals() {
 
   // Deduplicated: one misconfigured host produces one annotation, not one per request. A wall of
   // identical annotations is the same as none.
-  const refusals = [...new Set(
-    contents.split('\n').filter((l) => /^deter-guard: (DENY|BLOCK)\b/.test(l)),
-  )]
+  const lines = contents.split('\n')
+  const seen = (re) => [...new Set(lines.filter((l) => re.test(l)))]
+  const refusals = seen(/^deter-guard: (DENY|BLOCK)\b/)
+  // Monitor mode. Deliberately NOT an error annotation: nothing failed, the job passed, and marking
+  // a green run red is how a team learns to ignore these. It is still an annotation rather than a
+  // log line, because the whole point of the run was to produce this list.
+  const observed = seen(/^deter-guard: WOULD-DENY\b/)
+
   for (const line of refusals) {
     log(`::error title=Egress refused::${line.replace(/^deter-guard: /, '')}`)
   }
+  for (const line of observed) {
+    log(`::warning title=Egress would be refused::${line.replace(/^deter-guard: /, '')}`)
+  }
+
   if (refusals.length > 0) {
     log(`::notice title=deter-guard::${refusals.length} host(s) were refused by your egress policy. ` +
         'Permit them in the deter console if they are legitimate — do not disable the guard.')
+  } else if (observed.length > 0) {
+    log(`::notice title=deter-guard::${observed.length} host(s) would have been refused. This job ran ` +
+        'in monitor mode, so nothing was blocked and nothing is protected. Permit what belongs in ' +
+        'your policy, then set `mode: enforce`.')
   }
 }
 

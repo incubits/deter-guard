@@ -122,7 +122,7 @@ type guardServer struct {
 //
 // addr of "" means loopback. port of 0 means "let the kernel choose", which is what exec wants and
 // what makes two jobs on one runner safe.
-func startGuard(pol *Policy, rep *reporter, addr string, port int, caPath string, removeCA, verbose bool) (*guardServer, error) {
+func startGuard(pol *Policy, rep *reporter, mode Mode, addr string, port int, caPath string, removeCA, verbose bool) (*guardServer, error) {
 	ca, err := newCertAuthority()
 	if err != nil {
 		return nil, err
@@ -155,7 +155,7 @@ func startGuard(pol *Policy, rep *reporter, addr string, port int, caPath string
 			"never to a shared one.", addr)
 	}
 
-	px := newProxy(pol, ca, rep, verbose)
+	px := newProxy(pol, ca, rep, mode, verbose)
 	srv := &http.Server{Handler: px}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -172,8 +172,15 @@ func startGuard(pol *Policy, rep *reporter, addr string, port int, caPath string
 		reporter: rep,
 		removeCA: removeCA,
 	}
-	logf("egress proxy on %s · policy version %d · %d rule(s), %d block(s)",
-		g.proxyURL, pol.Version, len(pol.Rules), len(pol.Blocked))
+	logf("egress proxy on %s · policy version %d · %d rule(s), %d block(s) · mode %s",
+		g.proxyURL, pol.Version, len(pol.Rules), len(pol.Blocked), mode)
+	if mode == ModeMonitor {
+		// Said at the top as well as at the bottom. A summary at the end of a job nobody scrolls to
+		// is not a warning, and the difference between the two modes is the difference between a
+		// guarded pipeline and one that only looks guarded.
+		logf("MONITOR MODE: nothing will be blocked. Refusals are logged, reported and summarised " +
+			"at the end of the run; the requests are made anyway.")
+	}
 	return g, nil
 }
 
@@ -191,6 +198,9 @@ func (g *guardServer) stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = g.srv.Shutdown(ctx)
 	cancel()
+	// After the shutdown, so the tally is not printed while it is still being written to, and before
+	// the reporter's last flush, so a slow console cannot delay the one output a developer reads.
+	g.px.logSummary()
 	g.reporter.Close()
 	if g.removeCA {
 		os.Remove(g.caPath)
@@ -438,7 +448,7 @@ func runServeCommand(o opts, argv []string) int {
 		return code
 	}
 
-	g, err := startGuard(pol, rep, o.addr, o.port, caPath, removeCA, o.verbose)
+	g, err := startGuard(pol, rep, o.mode, o.addr, o.port, caPath, removeCA, o.verbose)
 	if err != nil {
 		errf("%s", err)
 		return exitUsage

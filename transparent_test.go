@@ -25,14 +25,14 @@ import (
 
 // transparentFixture wires a proxy whose upstream always lands on `origin`, and returns the address
 // of its transparent TLS listener.
-func transparentFixture(t *testing.T, p *Policy, origin *httptest.Server) (tlsAddr, httpAddr string, px *proxy) {
+func transparentFixture(t *testing.T, p *Policy, origin *httptest.Server, mode Mode) (tlsAddr, httpAddr string, px *proxy) {
 	t.Helper()
 
 	ca, err := newCertAuthority()
 	if err != nil {
 		t.Fatal(err)
 	}
-	px = newProxy(p, ca, nil, false)
+	px = newProxy(p, ca, nil, mode, false)
 
 	originRoot := x509.NewCertPool()
 	originRoot.AddCert(origin.Certificate())
@@ -83,7 +83,7 @@ func TestTransparentAllowsAPermittedHostByItsSNI(t *testing.T) {
 	// example.com is what httptest's certificate is issued for, so the upstream leg verifies for real
 	// rather than being skipped.
 	p := &Policy{Version: 5, Rules: []Rule{{Host: "example.com"}}}
-	tlsAddr, _, px := transparentFixture(t, p, origin)
+	tlsAddr, _, px := transparentFixture(t, p, origin, ModeEnforce)
 
 	trust := x509.NewCertPool()
 	trust.AppendCertsFromPEM(px.ca.caPEM())
@@ -109,7 +109,7 @@ func TestTransparentRefusesAnUnlistedHostWithA403(t *testing.T) {
 	defer origin.Close()
 
 	p := &Policy{Version: 5, Rules: []Rule{{Host: "example.com"}}}
-	tlsAddr, _, px := transparentFixture(t, p, origin)
+	tlsAddr, _, px := transparentFixture(t, p, origin, ModeEnforce)
 
 	trust := x509.NewCertPool()
 	trust.AppendCertsFromPEM(px.ca.caPEM())
@@ -139,7 +139,7 @@ func TestTransparentRefusesAConnectionWithNoSNI(t *testing.T) {
 	defer origin.Close()
 
 	p := &Policy{Version: 5, Rules: []Rule{{Host: "example.com"}}}
-	tlsAddr, _, _ := transparentFixture(t, p, origin)
+	tlsAddr, _, _ := transparentFixture(t, p, origin, ModeEnforce)
 
 	conn, err := net.Dial("tcp", tlsAddr)
 	if err != nil {
@@ -166,7 +166,7 @@ func TestTransparentHTTPUsesTheHostHeader(t *testing.T) {
 	defer origin.Close()
 
 	p := &Policy{Version: 5, Rules: []Rule{{Host: "example.com"}}}
-	_, httpAddr, _ := transparentFixture(t, p, origin)
+	_, httpAddr, _ := transparentFixture(t, p, origin, ModeEnforce)
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,

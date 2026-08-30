@@ -73,6 +73,14 @@ inputs:
       them fails the build rather than stopping the runner reporting it.
     required: false
     default: "false"
+  mode:
+    description: >-
+      `enforce` (default) refuses a request the policy does not permit. `monitor` makes the same
+      decision, reports it, and lets the request through anyway — so a first run tells you what the
+      policy would refuse without failing the job. A job in monitor mode is NOT protected; it is
+      measuring. Refused hosts arrive as warning annotations rather than errors.
+    required: false
+    default: "enforce"
   verbose:
     description: Log allowed requests too, not just refusals.
     required: false

@@ -72,8 +72,13 @@ func (p *proxy) serveTransparentTLS(conn net.Conn) {
 	tlsConn := tls.Server(conn, cfg)
 	if err := tlsConn.Handshake(); err != nil {
 		if sni == "" {
-			logf("DENY  TLS connection with no SNI — cannot identify the host, so it is refused")
-			p.record(Decision{Kind: "deny_policy", Reason: "no SNI"}, "<no SNI>", "CONNECT", "")
+			// Malformed: unidentifiable in monitor mode too, since there is no host to forward
+			// this connection to even if the policy were only being observed.
+			p.record(Decision{
+				Kind:      "deny_policy",
+				Reason:    "no SNI — cannot tell which host this connection is for",
+				Malformed: true,
+			}, "<no SNI>", "CONNECT", "")
 		} else {
 			logf("TLS handshake with the build failed for %s (%s) — is the guard CA trusted?", sni, err)
 		}
@@ -84,9 +89,12 @@ func (p *proxy) serveTransparentTLS(conn net.Conn) {
 	defer tlsConn.Close()
 
 	if d := p.policy.CheckTunnel(sni); !d.Allow {
-		p.record(d, sni, "CONNECT", "")
-		p.serveRefusals(tlsConn, sni, d)
-		return
+		if !p.record(d, sni, "CONNECT", "") {
+			p.serveRefusals(tlsConn, sni, d)
+			return
+		}
+		// Monitor mode: on through serveTunnel, which decides and reports each request inside on
+		// its own merits. See handleConnect for why the paths are worth this.
 	}
 
 	// Port 443 by definition: this connection was redirected from it.
@@ -102,7 +110,7 @@ func (p *proxy) transparentHTTP() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host == "" {
 			// Same reasoning as a missing SNI: unidentifiable is refused.
-			d := Decision{Kind: "deny_policy", Reason: "no Host header"}
+			d := Decision{Kind: "deny_policy", Reason: "no Host header", Malformed: true}
 			p.record(d, "<no Host>", r.Method, r.URL.Path)
 			p.writeRefusal(w, d, "")
 			return
@@ -124,8 +132,7 @@ func (p *proxy) transparentHTTP() http.Handler {
 		}
 
 		d := p.policy.Check(host, r.Method, match)
-		p.record(d, host, r.Method, match)
-		if !d.Allow {
+		if !p.record(d, host, r.Method, match) {
 			p.writeRefusal(w, d, host)
 			return
 		}

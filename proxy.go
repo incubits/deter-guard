@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,14 +42,25 @@ type proxy struct {
 	// the build's TLS must not mean accepting anything on the way out, or the proxy would downgrade
 	// the security it exists to enforce.
 	upstream *http.Transport
-	verbose  bool
+	// What a refusal DOES — see mode.go. The decision above it is the same either way.
+	mode    Mode
+	verbose bool
+
+	// The end-of-run tally, written from every connection the proxy is serving.
+	mu             sync.Mutex
+	refusals       map[refusalKey]*refusal
+	order          []refusalKey
+	allowed        int64
+	summaryDropped int64
 }
 
-func newProxy(p *Policy, ca *certAuthority, r *reporter, verbose bool) *proxy {
+func newProxy(p *Policy, ca *certAuthority, r *reporter, mode Mode, verbose bool) *proxy {
 	return &proxy{
 		policy:   p,
 		ca:       ca,
 		reporter: r,
+		mode:     mode,
+		refusals: map[refusalKey]*refusal{},
 		upstream: &http.Transport{
 			Proxy:                 nil, // never chain into another proxy by accident
 			TLSClientConfig:       &tls.Config{RootCAs: rootCAs()},
@@ -74,31 +86,48 @@ func newProxy(p *Policy, ca *certAuthority, r *reporter, verbose bool) *proxy {
 // malformedHost is the refusal for an authority that is not a host — see canonical.go for why one
 // is refused outright rather than cleaned up.
 var malformedHost = Decision{
-	Allow:  false,
-	Kind:   "deny_policy",
-	Reason: "malformed host — not a hostname or IP address",
+	Allow:     false,
+	Kind:      "deny_policy",
+	Reason:    "malformed host — not a hostname or IP address",
+	Malformed: true,
 }
 
 // malformedPath is the refusal for a request target that cannot be decoded.
 var malformedPath = Decision{
-	Allow:  false,
-	Kind:   "deny_policy",
-	Reason: "malformed request path — invalid percent-encoding",
+	Allow:     false,
+	Kind:      "deny_policy",
+	Reason:    "malformed request path — invalid percent-encoding",
+	Malformed: true,
 }
 
-// record sends a refusal to the console and, when asked, prints it. Allowed requests are never
-// reported — see the reporter.
-func (p *proxy) record(d Decision, host, method, path string) {
+// record sends a refusal to the console and, when asked, prints it, then reports whether the
+// request may PROCEED. Allowed requests are never reported — see the reporter.
+//
+// That return value is the whole of monitor mode at the call sites: each one refuses when this says
+// no and continues when it says yes, so there is exactly one place where the two modes differ and no
+// path can end up enforced in one mode and not the other by omission.
+func (p *proxy) record(d Decision, host, method, path string) (proceed bool) {
+	p.tally(d, host, method, path)
 	if d.Allow {
 		if p.verbose {
 			logf("allow %s %s%s", method, host, path)
 		}
-		return
+		return true
 	}
-	logf("DENY  %s %s%s — %s", method, host, path, d.Reason)
+	// A request the guard could not identify is refused in BOTH modes. Monitor mode forwards what
+	// enforce would have blocked, and there is no destination to forward this one to.
+	observe := p.mode == ModeMonitor && !d.Malformed
+	if observe {
+		// A distinct word, because a build log full of DENY lines that denied nothing is how a
+		// monitored job gets mistaken for a protected one.
+		logf("WOULD-DENY %s %s%s — %s (monitor mode: allowed through)", method, host, path, d.Reason)
+	} else {
+		logf("DENY  %s %s%s — %s", method, host, path, d.Reason)
+	}
 	if p.reporter != nil {
 		p.reporter.note(d.Kind, host, method, path)
 	}
+	return observe
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,8 +153,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := p.policy.Check(host, r.Method, match)
-	p.record(d, host, r.Method, match)
-	if !d.Allow {
+	if !p.record(d, host, r.Method, match) {
 		p.writeRefusal(w, d, host)
 		return
 	}
@@ -240,11 +268,17 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if valid {
 		d = p.policy.CheckTunnel(host)
 	}
+	proceed := d.Allow
 	if !d.Allow {
 		// Logged and reported HERE, once, while we still have the tunnel-level decision. What
 		// follows serves 403s without recording them again, so a client's retry loop does not
 		// arrive at the console as a stream of fresh refusals.
-		p.record(d, r.Host, "CONNECT", "")
+		//
+		// In monitor mode this opens a tunnel to a host the policy does not permit, deliberately:
+		// the requests inside it are then decided and reported one by one, so the run produces the
+		// PATHS the policy will have to name rather than only the host. Enforce refuses at the
+		// tunnel and never learns them, which is correct there and useless here.
+		proceed = p.record(d, r.Host, "CONNECT", "")
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -293,7 +327,7 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Refused hosts get a real 403 inside the TLS session and nothing is dialled upstream. Doing it
 	// here rather than at the CONNECT is the whole point: see the comment on refusalJSON.
-	if !d.Allow {
+	if !proceed {
 		p.serveRefusals(tlsConn, r.Host, d)
 		return
 	}
@@ -343,9 +377,7 @@ func (p *proxy) serveTunnel(conn net.Conn, tunnelHost, tunnelPort string) {
 		}
 
 		d := p.policy.Check(host, req.Method, match)
-		p.record(d, host, req.Method, match)
-
-		if !d.Allow {
+		if !p.record(d, host, req.Method, match) {
 			// Written straight onto the connection, since there is no ResponseWriter in here.
 			_ = p.refusalResponse(d, host).Write(conn)
 			return

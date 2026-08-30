@@ -49,6 +49,10 @@ type reporter struct {
 	token   string
 	headers map[string]string
 	id      string
+	// Whether these refusals actually refused anything — see mode.go. Sent with every batch, because
+	// a console that counted a monitored run's observations as blocks would be reporting protection
+	// that did not happen.
+	mode Mode
 
 	mu      sync.Mutex
 	windows map[windowKey]*window
@@ -61,7 +65,7 @@ type reporter struct {
 
 // newReporter returns nil when reporting is not configured, which is the correct default: a client
 // pointed at no console reports nothing rather than failing.
-func newReporter(url, token string, headers map[string]string) *reporter {
+func newReporter(url, token string, headers map[string]string, mode Mode) *reporter {
 	if url == "" {
 		return nil
 	}
@@ -75,6 +79,7 @@ func newReporter(url, token string, headers map[string]string) *reporter {
 		url:     url,
 		token:   token,
 		headers: headers,
+		mode:    mode,
 		id:      hex.EncodeToString(buf)[:32],
 		windows: map[windowKey]*window{},
 		stop:    make(chan struct{}),
@@ -168,6 +173,7 @@ func (r *reporter) flush() {
 
 	body, err := json.Marshal(map[string]any{
 		"reporter": r.id, "batch": batch, "items": items, "dropped": dropped,
+		"mode": string(r.mode),
 	})
 	if err != nil {
 		return
