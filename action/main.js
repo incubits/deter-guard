@@ -69,6 +69,10 @@ function main() {
 
   const args = ['serve', '--detach', '--state-dir', stateDir]
   if (policyFile) args.push('--policy', policyFile)
+  // Passed through unvalidated: the guard already knows what its modes are called, and a second
+  // list of them here would be one more thing to keep in step. An unknown value fails the step with
+  // the guard's own message.
+  if (input('mode')) args.push('--mode', input('mode'))
   if (bool('verbose')) args.push('--verbose')
 
   // Transparent mode needs to write firewall rules and the system trust store, so it runs under
@@ -119,6 +123,12 @@ function main() {
 
   const proxy = (exported.match(/^HTTPS_PROXY=(.*)$/m) || [])[1] || 'the proxy'
   log(`deter-guard: every later step in this job now goes through ${proxy}`)
+  if (/^monitor$|^audit$|^dry-run$/i.test(input('mode'))) {
+    // A warning rather than a notice. Monitor mode is the correct first step and a bad resting
+    // place: the job looks guarded in every way except the one that matters.
+    log('::warning title=deter-guard::monitor mode — nothing will be blocked. What the policy ' +
+        'would have refused is listed at the end of the job.')
+  }
 }
 
 main()

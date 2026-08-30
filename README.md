@@ -43,6 +43,10 @@ as annotations on the run summary.
 
 > **First time?** Claim your GitHub organization in the console under
 > **CI protection → Trusted CI owners**. Until you do, the OIDC exchange is refused by design.
+>
+> Then add `mode: monitor` for the first few runs. The job reports what the policy *would* have
+> refused and blocks nothing, so you find out what your build actually talks to without finding out
+> the hard way. See [Monitor first, then enforce](#monitor-first-then-enforce).
 
 ### One command, anywhere
 
@@ -63,6 +67,7 @@ npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3
 | --- | --- | --- |
 | `console` | — | Console base URL. Required unless `policy` is set. |
 | `pubkey` | — | Pin the policy signing key (hex). **Strongly recommended.** |
+| `mode` | `enforce` | `monitor` reports what the policy *would* refuse and blocks nothing. See [On GitHub Actions](#on-github-actions). |
 | `transparent` | `false` | Intercept at the kernel instead of via proxy variables. See [Modes](#modes). |
 | `policy` | — | Local **unsigned** policy file to enforce instead of fetching one. |
 | `image` | matches the action's own ref | Image to take the binary from. Set it only to pull from a mirror of your own — see [Versions](#versions). |
@@ -88,10 +93,16 @@ Image tags follow the same shape, plus `:latest`, which is the **newest release*
 `main`, which is `:main`:
 
 ```
-ghcr.io/incubits/deter-guard:1        # newest 1.x
+ghcr.io/incubits/deter-guard:latest   # newest release — what the examples here use
+ghcr.io/incubits/deter-guard:1        # newest 1.x, so a major bump never arrives unannounced
 ghcr.io/incubits/deter-guard:1.4.2    # exactly that
 ghcr.io/incubits/deter-guard@sha256:… # a digest, from the release notes
 ```
+
+The examples here use `:latest` for the image and `@v1` for the action, which is not the
+inconsistency it looks like. A workflow can only resolve a branch, a tag, or a SHA, and there is no
+`latest` **tag** — `uses: …@latest` fails to resolve — while the registry does have a `:latest`. When
+you want the run reproducible, pin both: `@v1.4.2` and the digest from the release notes.
 
 Versions are semver, and the major number is a promise about the action inputs, the CLI flags and
 the environment variables — the surfaces you have written down somewhere. Every release is a
@@ -119,7 +130,96 @@ where the build is told to trust it, and dies with the job.
 
 ---
 
+## Monitor first, then enforce
+
+```bash
+deter-guard exec --mode monitor -- npm ci
+```
+
+Nobody knows every host their build touches. Transitive installs, a vendored toolchain, one telemetry
+endpoint somebody added in 2019 — and the first pipeline anyone wants a policy on is the one they
+cannot afford to break. Turning enforcement on blind means a red build, an urgent revert, and a
+control that is now switched off. **A policy nobody dares enable protects nothing.**
+
+Monitor mode is the run that produces the list:
+
+| | `--mode monitor` | `--mode enforce` (default) |
+| --- | --- | --- |
+| The decision | made, logged, reported | made, logged, reported |
+| The request | goes through | **403**, never dialled onward |
+| Your build | passes | fails at the first refused fetch |
+
+```
+deter-guard: egress proxy on http://127.0.0.1:52054 · policy version 812 · 4 rule(s), 118 block(s) · mode monitor
+deter-guard: MONITOR MODE: nothing will be blocked. Refusals are logged, reported and summarised at
+the end of the run; the requests are made anyway.
+deter-guard: WOULD-DENY GET telemetry.example.com/v1/events — host not permitted by the egress policy (monitor mode: allowed through)
+...
+deter-guard: MONITOR MODE SUMMARY: 12 request(s) across 3 target(s) WOULD have been refused (431 allowed by the policy). Nothing was blocked:
+deter-guard:        9 × GET registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz — left-pad 1.3.0 is on your organization's blocklist
+deter-guard:        2 × CONNECT telemetry.example.com:443 — host not permitted by the egress policy
+deter-guard:        1 × GET telemetry.example.com/v1/events — host not permitted by the egress policy
+deter-guard: permit whatever belongs in your egress policy, then run with --mode enforce to make
+this real. Until then this job is NOT protected.
+```
+
+The summary is the answer; the per-request lines are lost in forty thousand lines of build output.
+Identical refusals collapse, so a retry loop is one row rather than four hundred, and the list is in
+first-seen order — the first thing refused is usually what caused everything after it.
+
+**It is the same code path, not a simulator.** The policy is consulted, the refusal is built, and the
+only branch is whether the 403 is written or the request is let through. A dry run that
+re-implemented the decision would eventually disagree with the one that enforces, and you would find
+out in the direction of a broken build.
+
+Refusals reach the console either way — the batch carries the mode, so an observation is not counted
+as a block. On GitHub Actions they arrive as **warning** annotations rather than errors: nothing
+failed.
+
+One thing is refused in both modes: a request the guard cannot identify — a malformed authority, an
+undecodable path, a TLS connection with no SNI. There is no host to forward those to.
+
+> **A job in monitor mode is not protected.** It is a measurement, and it looks exactly like a
+> guarded job apart from the one property that matters. Move it to `enforce` once the list is empty.
+
+### On GitHub Actions
+
+One input. Enforcing is the default, so monitoring is the thing you have to ask for:
+
+```yaml
+      - uses: incubits/deter-guard@v1
+        with:
+          console: ${{ vars.DETER_CONSOLE_URL }}
+          pubkey: ${{ vars.DETER_POLICY_PUBKEY }}
+          mode: monitor          # default: enforce
+```
+
+The job runs green, the log ends with the summary, and every host that would have been refused
+appears as a **warning** annotation on the run — `Egress would be refused: WOULD-DENY GET …` — plus
+one notice saying how many there were and that nothing was protected.
+
+Flipping the whole org is one variable rather than a pull request against every workflow:
+
+```yaml
+          mode: ${{ vars.DETER_MODE || 'enforce' }}
+```
+
+Set the repository or organization variable `DETER_MODE` to `monitor`, let a few real jobs run, permit
+what belongs in the console — then delete the variable. Every pipeline goes back to enforcing without
+a workflow edit, and the fallback is the safe one, so a variable that is unset, renamed, or never
+created enforces rather than quietly stopping. A value the guard does not recognise **fails the
+step** — a typo cannot land you in a mode you did not choose.
+
+Outside the action: `--mode monitor` on `exec` and `serve`, or `DETER_MODE=monitor` in the
+environment. The action passes the input through as a flag, which wins over `DETER_MODE`, so set the
+input rather than the variable there.
+
+---
+
 ## Modes
+
+How traffic reaches the guard. Independent of [monitor or enforce](#monitor-first-then-enforce) —
+the two compose, and any combination is valid.
 
 | | Proxy mode | Transparent mode |
 | --- | --- | --- |
@@ -191,7 +291,7 @@ GitLab requires the job to *declare* its ID token, so pass it as `DETER_ID_TOKEN
 
 ```yaml
 policy:
-  image: ghcr.io/incubits/deter-guard:1
+  image: ghcr.io/incubits/deter-guard:latest
   id_tokens:
     DETER_ID_TOKEN: { aud: "deter-console" }
   variables:
@@ -210,7 +310,7 @@ docker run --rm \
   -e DETER_CI_TOKEN="$DETER_CI_TOKEN" \
   -e DETER_POLICY_PUBKEY="$DETER_POLICY_PUBKEY" \
   -v "$PWD:/workspace" \
-  ghcr.io/incubits/deter-guard:1 \
+  ghcr.io/incubits/deter-guard:latest \
   policy --project "$JOB_NAME" --run "$BUILD_TAG" --out /workspace/egress.cedar
 ```
 
@@ -260,6 +360,7 @@ Two things the action does that you now have to do yourself:
 
 | | |
 | --- | --- |
+| `--mode <mode>` | `enforce` (default) refuses. `monitor` decides and reports the same way, and lets the request through. See [Monitor first, then enforce](#monitor-first-then-enforce). |
 | `--policy <path>` | Enforce a local policy file instead of fetching one. **Unsigned** — nothing is verified, and it says so on every run. |
 | `--state-dir <dir>` | Where the CA the build must trust is written. Defaults to a temp dir. |
 | `--verbose` | Log allowed requests too, not just refusals. |
@@ -339,7 +440,9 @@ A real HTTP **403**, delivered inside the TLS session, naming the host and polic
 }
 ```
 
-Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward.
+Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward. Under
+`--mode monitor` this response is never written: the same decision is logged and reported, and the
+request goes through. See [Monitor first, then enforce](#monitor-first-then-enforce).
 
 **The status code is the point.** Refusing at `CONNECT` instead gives the client a *transport* error
 (`UND_ERR_ABORTED`), and every package manager retries those — so a refusal decided in the first
@@ -359,7 +462,7 @@ One `COPY`. The binary is static and carries its own root certificates, so it ne
 libc, or anything else from the image it lands in:
 
 ```dockerfile
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 ```
 
 There are four ways to put it in front of a build, differing in how hard it is for the build to get
@@ -392,7 +495,7 @@ rather than implying a containment it is not providing.
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 RUN deter-guard exec -- npm ci
 ```
 
@@ -405,7 +508,7 @@ inherit it:
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 
 # A FIXED port and CA path, so these can be baked in — which is what makes
 # `docker exec` into a running container covered too, not just the CMD.
@@ -448,7 +551,7 @@ proxy, rewrite its rules, or unset its way around it, because none of it is in i
 ```yaml
 services:
   guard:
-    image: ghcr.io/incubits/deter-guard:1
+    image: ghcr.io/incubits/deter-guard:latest
     command: ["serve", "--addr", "0.0.0.0", "--port", "3128", "--ca-out", "/shared/ca.pem"]
     volumes: ["shared:/shared"]
   build:
@@ -481,6 +584,7 @@ process is consulted, so nothing can opt out — shape 3's property without a se
 | `DETER_CI_OIDC_AUDIENCE` | `--audience` | Default `deter-console`. Must match the console. |
 | `DETER_PROJECT` | `--project` | Project id, for a `dtrc_` token. |
 | `DETER_RUN_ID` | `--run` | Run id — deduplicates usage across retries. |
+| `DETER_MODE` | `--mode` | `enforce` (default) or `monitor`. |
 | `DETER_POLICY_FILE` | `--policy` | Enforce a local, **unsigned** policy file. |
 | `DETER_STATE_DIR` | `--state-dir` | Where the CA and state file go. |
 | `DETER_GUARD_ADDR` | `--addr` | `serve` listen address. Default `127.0.0.1`. |
@@ -517,7 +621,7 @@ Distinct on purpose — a pipeline shouldn't have to grep stderr.
 Built by GitHub Actions with a provenance attestation:
 
 ```bash
-gh attestation verify oci://ghcr.io/incubits/deter-guard:1 --repo incubits/deter-guard
+gh attestation verify oci://ghcr.io/incubits/deter-guard:latest --repo incubits/deter-guard
 ```
 
 Pin `sha-<commit>`, or the digest from the release notes, for an immutable reference. See
