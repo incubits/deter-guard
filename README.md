@@ -93,10 +93,16 @@ Image tags follow the same shape, plus `:latest`, which is the **newest release*
 `main`, which is `:main`:
 
 ```
-ghcr.io/incubits/deter-guard:1        # newest 1.x
+ghcr.io/incubits/deter-guard:latest   # newest release — what the examples here use
+ghcr.io/incubits/deter-guard:1        # newest 1.x, so a major bump never arrives unannounced
 ghcr.io/incubits/deter-guard:1.4.2    # exactly that
 ghcr.io/incubits/deter-guard@sha256:… # a digest, from the release notes
 ```
+
+The examples here use `:latest` for the image and `@v1` for the action, which is not the
+inconsistency it looks like. A workflow can only resolve a branch, a tag, or a SHA, and there is no
+`latest` **tag** — `uses: …@latest` fails to resolve — while the registry does have a `:latest`. When
+you want the run reproducible, pin both: `@v1.4.2` and the digest from the release notes.
 
 Versions are semver, and the major number is a promise about the action inputs, the CLI flags and
 the environment variables — the surfaces you have written down somewhere. Every release is a
@@ -285,7 +291,7 @@ GitLab requires the job to *declare* its ID token, so pass it as `DETER_ID_TOKEN
 
 ```yaml
 policy:
-  image: ghcr.io/incubits/deter-guard:1
+  image: ghcr.io/incubits/deter-guard:latest
   id_tokens:
     DETER_ID_TOKEN: { aud: "deter-console" }
   variables:
@@ -304,7 +310,7 @@ docker run --rm \
   -e DETER_CI_TOKEN="$DETER_CI_TOKEN" \
   -e DETER_POLICY_PUBKEY="$DETER_POLICY_PUBKEY" \
   -v "$PWD:/workspace" \
-  ghcr.io/incubits/deter-guard:1 \
+  ghcr.io/incubits/deter-guard:latest \
   policy --project "$JOB_NAME" --run "$BUILD_TAG" --out /workspace/egress.cedar
 ```
 
@@ -456,7 +462,7 @@ One `COPY`. The binary is static and carries its own root certificates, so it ne
 libc, or anything else from the image it lands in:
 
 ```dockerfile
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 ```
 
 There are four ways to put it in front of a build, differing in how hard it is for the build to get
@@ -489,7 +495,7 @@ rather than implying a containment it is not providing.
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 RUN deter-guard exec -- npm ci
 ```
 
@@ -502,7 +508,7 @@ inherit it:
 
 ```dockerfile
 FROM node:22-slim
-COPY --from=ghcr.io/incubits/deter-guard:1 /deter-guard /usr/local/bin/deter-guard
+COPY --from=ghcr.io/incubits/deter-guard:latest /deter-guard /usr/local/bin/deter-guard
 
 # A FIXED port and CA path, so these can be baked in — which is what makes
 # `docker exec` into a running container covered too, not just the CMD.
@@ -545,7 +551,7 @@ proxy, rewrite its rules, or unset its way around it, because none of it is in i
 ```yaml
 services:
   guard:
-    image: ghcr.io/incubits/deter-guard:1
+    image: ghcr.io/incubits/deter-guard:latest
     command: ["serve", "--addr", "0.0.0.0", "--port", "3128", "--ca-out", "/shared/ca.pem"]
     volumes: ["shared:/shared"]
   build:
@@ -615,7 +621,7 @@ Distinct on purpose — a pipeline shouldn't have to grep stderr.
 Built by GitHub Actions with a provenance attestation:
 
 ```bash
-gh attestation verify oci://ghcr.io/incubits/deter-guard:1 --repo incubits/deter-guard
+gh attestation verify oci://ghcr.io/incubits/deter-guard:latest --repo incubits/deter-guard
 ```
 
 Pin `sha-<commit>`, or the digest from the release notes, for an immutable reference. See
