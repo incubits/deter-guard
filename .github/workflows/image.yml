@@ -167,7 +167,40 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The guard below exchanges this job's OIDC token for the organization's signed policy. Without
+      # this there is no credential to offer, and the step fails — which is the intended failure: a
+      # job that cannot prove who it is does not get a policy.
+      id-token: write
     steps:
+      # We are the first customer of the thing we publish.
+      #
+      # First step in the job, ahead of the checkout, because a guard that starts after the
+      # dependencies are on disk is a guard that watched them arrive. From here the checkout, the Go
+      # toolchain `setup-go` downloads, and everything the tests reach all go through it — which is
+      # also how a break in our own action becomes our problem before it is a customer's.
+      #
+      # `@v1`, not `uses: ./`: the released action pulls the released image, so this exercises what
+      # somebody pasting the README actually gets, rather than a local copy that only resembles it.
+      #
+      # Skipped for a pull request from a fork. GitHub hands those a read-only token — `id-token:
+      # write` is not granted no matter what the block above says — so the exchange cannot happen and
+      # the step would fail every external contribution. Same reason the ghcr login below is skipped,
+      # and the same trade.
+      - uses: incubits/deter-guard@v1
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          # Written out rather than read from `vars`, so the diff shows what this job trusts. It is
+          # the same hosted console the claim action already defaults to.
+          console: https://console.deter.dev
+          # A public key, committed on purpose. Pinned here, the signature check proves the policy
+          # came from us; unpinned, it proves only that the bundle agrees with itself.
+          pubkey: 22904602ba78d226d66115475d193f787febfb1d862fb963d60f0f376b47c66a
+          # mode: monitor  # optional: report what would be refused, block nothing
+
       - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
         with:
