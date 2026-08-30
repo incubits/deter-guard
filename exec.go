@@ -185,7 +185,7 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 		pinned = sessionKey
 	}
 
-	p, served, verified, err := fetchRules(ctx, o.consoleURL, token, pinned, headers)
+	p, served, verified, err := fetchRules(ctx, o.consoleURL, token, pinned, headers, o.mode)
 	if err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Status < 500 {
