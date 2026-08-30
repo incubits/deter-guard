@@ -67,7 +67,7 @@ npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3
 | --- | --- | --- |
 | `console` | — | Console base URL. Required unless `policy` is set. |
 | `pubkey` | — | Pin the policy signing key (hex). **Strongly recommended.** |
-| `mode` | `enforce` | `monitor` reports what the policy *would* refuse and blocks nothing. See [Monitor first, then enforce](#monitor-first-then-enforce). |
+| `mode` | `enforce` | `monitor` reports what the policy *would* refuse and blocks nothing. See [On GitHub Actions](#on-github-actions). |
 | `transparent` | `false` | Intercept at the kernel instead of via proxy variables. See [Modes](#modes). |
 | `policy` | — | Local **unsigned** policy file to enforce instead of fetching one. |
 | `image` | matches the action's own ref | Image to take the binary from. Set it only to pull from a mirror of your own — see [Versions](#versions). |
@@ -175,6 +175,38 @@ undecodable path, a TLS connection with no SNI. There is no host to forward thos
 
 > **A job in monitor mode is not protected.** It is a measurement, and it looks exactly like a
 > guarded job apart from the one property that matters. Move it to `enforce` once the list is empty.
+
+### On GitHub Actions
+
+One input. Enforcing is the default, so monitoring is the thing you have to ask for:
+
+```yaml
+      - uses: incubits/deter-guard@v1
+        with:
+          console: ${{ vars.DETER_CONSOLE_URL }}
+          pubkey: ${{ vars.DETER_POLICY_PUBKEY }}
+          mode: monitor          # default: enforce
+```
+
+The job runs green, the log ends with the summary, and every host that would have been refused
+appears as a **warning** annotation on the run — `Egress would be refused: WOULD-DENY GET …` — plus
+one notice saying how many there were and that nothing was protected.
+
+Flipping the whole org is one variable rather than a pull request against every workflow:
+
+```yaml
+          mode: ${{ vars.DETER_MODE || 'enforce' }}
+```
+
+Set the repository or organization variable `DETER_MODE` to `monitor`, let a few real jobs run, permit
+what belongs in the console — then delete the variable. Every pipeline goes back to enforcing without
+a workflow edit, and the fallback is the safe one, so a variable that is unset, renamed, or never
+created enforces rather than quietly stopping. A value the guard does not recognise **fails the
+step** — a typo cannot land you in a mode you did not choose.
+
+Outside the action: `--mode monitor` on `exec` and `serve`, or `DETER_MODE=monitor` in the
+environment. The action passes the input through as a flag, which wins over `DETER_MODE`, so set the
+input rather than the variable there.
 
 ---
 
