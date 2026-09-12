@@ -64,8 +64,12 @@ type opts struct {
 	asJSON     bool
 	// exec and serve
 	policyFile string
-	stateDir   string
-	verbose    bool
+	// The supply-chain blocklist: a local document instead of the console's, and the switch that
+	// turns package blocking off entirely. See supplychain.go.
+	supplyFile    string
+	noSupplyChain bool
+	stateDir      string
+	verbose       bool
 	// What a refusal does. modeName is the raw flag; mode is it parsed, and is what everything else
 	// reads — see mode.go.
 	modeName string
@@ -116,6 +120,9 @@ exec and serve options:
   --mode <mode>      monitor: report what WOULD be refused, block nothing    (env DETER_MODE)
                      enforce: refuse it, the default
   --policy <path>    Use a local policy file instead of the console (UNSIGNED)
+  --supply-chain <p> Use a local supply-chain document instead of the console (UNSIGNED)
+  --no-supply-chain  Do not block known-malicious or vulnerable packages at all
+                     (env DETER_NO_SUPPLY_CHAIN)
   --state-dir <dir>  Where the CA and state file go (env DETER_STATE_DIR, default: temp dir)
   --verbose          Log allowed requests too, not just refusals
 
@@ -252,6 +259,8 @@ func run() int {
 	fs.StringVar(&o.run, "run", env("DETER_RUN_ID", ""), "")
 	fs.BoolVar(&o.asJSON, "json", false, "")
 	fs.StringVar(&o.policyFile, "policy", env("DETER_POLICY_FILE", ""), "")
+	fs.StringVar(&o.supplyFile, "supply-chain", env("DETER_SUPPLY_CHAIN_FILE", ""), "")
+	fs.BoolVar(&o.noSupplyChain, "no-supply-chain", env("DETER_NO_SUPPLY_CHAIN", "") != "", "")
 	fs.StringVar(&o.stateDir, "state-dir", env("DETER_STATE_DIR", ""), "")
 	fs.StringVar(&o.modeName, "mode", env("DETER_MODE", ""), "")
 	fs.BoolVar(&o.verbose, "verbose", false, "")

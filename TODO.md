@@ -10,7 +10,7 @@ Ordered by what it costs to be wrong about them, not by effort.
 
 ## Security
 
-### Rollback protection on the signed policy
+### Rollback protection on the signed artifacts
 
 `Version` is covered by the ed25519 signature but never compared against anything, and nothing is
 persisted between runs. A **previously valid** bundle therefore verifies forever: anyone who can
@@ -21,6 +21,13 @@ gets *newer*.
 Cheapest closure is a floor: `--min-version` / `DETER_POLICY_MIN_VERSION`, refusing anything below
 it. A run that remembers the highest version it has seen (in the state dir) would be better still,
 but the floor is the part that can ship this week.
+
+This now applies **twice over**. The supply-chain document carries its version inside the signed
+payload for exactly this reason, and it is the artifact where a rollback is cheapest to exploit: it
+is republished every fifteen minutes, so "an hour old" is unremarkable and a document from before a
+campaign was catalogued still verifies perfectly. Worse, it fails open by design, so a replayed
+document produces no error at all — the build installs the package and the log says the blocklist
+verified. A floor there is worth more than a floor on the policy.
 
 ### `govulncheck` in CI
 
@@ -74,7 +81,9 @@ unaffected, which is why nobody notices — the refusals just quietly stop arriv
 ### `exec` never re-fetches the policy
 
 A blocklist entry published mid-build is not picked up until the next run. That is a defensible
-decision; it is not a documented one.
+decision; it is not a documented one. It bites harder now that the supply-chain document is pulled
+the same way: that one moves every fifteen minutes, so a long build can be running against a
+blocklist that was current when it started and is not by the time it installs anything.
 
 ### No upstream-proxy chaining
 
@@ -95,6 +104,25 @@ policy file that verified. Write to a temp file in the same directory and rename
 ### `deter-guard policy --help` exits 1
 
 `flag.ErrHelp` falls into the parse-error branch, so asking for help is reported as a usage error.
+
+### Package names are matched as 64-bit hashes
+
+`supplyChain` stores `hash("npm/name")` rather than the name, mirroring the broker: ~232k entries
+cost a few megabytes instead of 15–25, and a process sitting in the middle of a build's TLS never
+holds the organization's dependency list in memory. The cost is a false block on a collision — about
+one in four hundred million at this corpus size, which is far below the other things that can go
+wrong here, but it is not zero and it is not currently detectable. Storing the name alongside the
+hash for the ~25k pinned entries and the ~3.5k vulnerable ones would close it for everything except
+the typosquat tail, where a collision is also least consequential.
+
+### Nothing verifies that the two matchers agree with the console
+
+`supplychain_vector_test.go` pins one document the console actually signed, which catches a format
+divergence. It does not catch a *semantic* one: a change to how the console compiles ranges, or to
+how this file evaluates them, that still parses. The console's `match.test.ts` and this package's
+tests are separate bodies of cases over one specification. A shared table — the same inputs and
+expected verdicts, read by both — is what would make a disagreement fail somewhere rather than
+quietly enforce differently on a laptop and in CI.
 
 ## Housekeeping
 

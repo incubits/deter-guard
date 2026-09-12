@@ -122,7 +122,7 @@ type guardServer struct {
 //
 // addr of "" means loopback. port of 0 means "let the kernel choose", which is what exec wants and
 // what makes two jobs on one runner safe.
-func startGuard(pol *Policy, rep *reporter, mode Mode, addr string, port int, caPath string, removeCA, verbose bool) (*guardServer, error) {
+func startGuard(pol *Policy, sc *supplyChain, rep *reporter, mode Mode, addr string, port int, caPath string, removeCA, verbose bool) (*guardServer, error) {
 	ca, err := newCertAuthority()
 	if err != nil {
 		return nil, err
@@ -155,7 +155,7 @@ func startGuard(pol *Policy, rep *reporter, mode Mode, addr string, port int, ca
 			"never to a shared one.", addr)
 	}
 
-	px := newProxy(pol, ca, rep, mode, verbose)
+	px := newProxy(pol, sc, ca, rep, mode, verbose)
 	srv := &http.Server{Handler: px}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -174,6 +174,12 @@ func startGuard(pol *Policy, rep *reporter, mode Mode, addr string, port int, ca
 	}
 	logf("egress proxy on %s · policy version %d · %d rule(s), %d block(s) · mode %s",
 		g.proxyURL, pol.Version, len(pol.Rules), len(pol.Blocked), mode)
+	if sc == nil {
+		// Said here rather than only where the pull failed, because this line is the one an operator
+		// reads to see what the guard is doing — and "packages are not being checked" belongs next
+		// to "the proxy is up", not fifty lines earlier.
+		logf("package blocking is NOT in force for this build — the egress policy is unaffected")
+	}
 	if mode == ModeMonitor {
 		// Said at the top as well as at the bottom. A summary at the end of a job nobody scrolls to
 		// is not a warning, and the difference between the two modes is the difference between a
@@ -442,13 +448,14 @@ func runServeCommand(o opts, argv []string) int {
 		removeCA = o.wrap
 	}
 
-	pol, rep, code, err := resolvePolicy(o)
+	e, code, err := resolvePolicy(o)
 	if err != nil {
 		errf("%s", err)
 		return code
 	}
+	pol := e.policy
 
-	g, err := startGuard(pol, rep, o.mode, o.addr, o.port, caPath, removeCA, o.verbose)
+	g, err := startGuard(pol, e.supply, e.reporter, o.mode, o.addr, o.port, caPath, removeCA, o.verbose)
 	if err != nil {
 		errf("%s", err)
 		return exitUsage

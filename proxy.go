@@ -35,7 +35,11 @@ import (
 const upstreamTimeout = 10 * time.Minute
 
 type proxy struct {
-	policy   *Policy
+	policy *Policy
+	// The SECOND artifact this proxy enforces, and nil is an ordinary value for it: no document
+	// published, no console, or a pull that failed. Package blocking fails OPEN — see
+	// supplychainpull.go for why it must, and why that is the opposite of the egress policy.
+	supply   *supplyChain
 	ca       *certAuthority
 	reporter *reporter
 	// Upstream client. Verifies origin certificates against real roots (see roots.go): intercepting
@@ -51,12 +55,14 @@ type proxy struct {
 	refusals       map[refusalKey]*refusal
 	order          []refusalKey
 	allowed        int64
+	observed       int64
 	summaryDropped int64
 }
 
-func newProxy(p *Policy, ca *certAuthority, r *reporter, mode Mode, verbose bool) *proxy {
+func newProxy(p *Policy, sc *supplyChain, ca *certAuthority, r *reporter, mode Mode, verbose bool) *proxy {
 	return &proxy{
 		policy:   p,
+		supply:   sc,
 		ca:       ca,
 		reporter: r,
 		mode:     mode,
@@ -116,11 +122,17 @@ func (p *proxy) record(d Decision, host, method, path string) (proceed bool) {
 	}
 	// A request the guard could not identify is refused in BOTH modes. Monitor mode forwards what
 	// enforce would have blocked, and there is no destination to forward this one to.
-	observe := p.mode == ModeMonitor && !d.Malformed
+	observe := (p.mode == ModeMonitor || d.Observe) && !d.Malformed
 	if observe {
 		// A distinct word, because a build log full of DENY lines that denied nothing is how a
-		// monitored job gets mistaken for a protected one.
-		logf("WOULD-DENY %s %s%s — %s (monitor mode: allowed through)", method, host, path, d.Reason)
+		// monitored job gets mistaken for a protected one. Which of the two reasons applies matters
+		// to whoever reads it: one is how this RUN was invoked, the other is how the organization
+		// configured that class of finding, and they are fixed in different places.
+		why := "monitor mode: allowed through"
+		if d.Observe && p.mode != ModeMonitor {
+			why = "reported, not blocked"
+		}
+		logf("WOULD-DENY %s %s%s — %s (%s)", method, host, path, d.Reason, why)
 	} else {
 		logf("DENY  %s %s%s — %s", method, host, path, d.Reason)
 	}
@@ -128,6 +140,58 @@ func (p *proxy) record(d Decision, host, method, path string) (proceed bool) {
 		p.reporter.note(d.Kind, host, method, path)
 	}
 	return observe
+}
+
+// checkSupply decides one request against the supply-chain blocklist, and reports whether it had
+// anything to say at all.
+//
+// Placed AFTER the egress policy has permitted the request, which is the only order that makes
+// sense: this asks "may this organization install this package", and a host it may not reach at all
+// never gets that far. The broker makes the same call at the same point, for the additional reason
+// that it injects credentials there — never into a request about to be denied.
+//
+// Only tarball fetches are decided. Metadata requests stay allowed or dependency resolution breaks
+// before it ever reaches a blocked version, and a blocklist that also broke `npm view` is one an
+// organization switches off by the end of the week.
+func (p *proxy) checkSupply(host, path string) (Decision, bool) {
+	if p.supply == nil {
+		return Decision{}, false
+	}
+	if !p.supply.covers(host) {
+		return Decision{}, false
+	}
+	// A blocklist the console stopped refreshing is a silently degraded control. Most organizations
+	// keep last-known-good and accept that; one whose compliance posture cannot accept it sets
+	// on_stale=block_registry, and then the registry closes rather than the blocklist rotting open.
+	if p.supply.Posture.OnStale == scStaleBlock && p.supply.stale(time.Now()) {
+		hit := &supplyHit{Reason: "stale", Block: true, BlocklistVersion: p.supply.Version,
+			Detail: "the blocklist could not be refreshed and this organization refuses registry " +
+				"access rather than install against a stale one"}
+		return Decision{
+			Allow: false, Kind: "deny_supply_chain", Supply: hit,
+			Reason: "the supply-chain blocklist is stale — " + hit.Detail,
+		}, true
+	}
+	pkg, ok := parseRegistryPath(path, p.supply.Posture.Prefixes)
+	if !ok {
+		return Decision{}, false
+	}
+	hit, ok := p.supply.decide(pkg)
+	if !ok {
+		return Decision{}, false
+	}
+	hit.BlocklistVersion = p.supply.Version
+	kind := "monitor_supply_chain"
+	if hit.Block {
+		kind = "deny_supply_chain"
+	}
+	return Decision{
+		Allow:   false,
+		Kind:    kind,
+		Reason:  hit.message(),
+		Observe: !hit.Block,
+		Supply:  &hit,
+	}, true
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +221,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.writeRefusal(w, d, host)
 		return
 	}
+	if sd, ok := p.checkSupply(host, match); ok {
+		if !p.record(sd, host, r.Method, match) {
+			p.writeRefusal(w, sd, host)
+			return
+		}
+	}
 	p.forward(w, r, upstreamURL("http", host, port, forward, match, r.URL.RawQuery))
 }
 
@@ -179,6 +249,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 const refusalFix = "permit this host in the deter console, under your organization's egress policy"
 
 func refusalJSON(d Decision, host string, version int64) []byte {
+	if d.Supply != nil {
+		return supplyRefusalJSON(d, host, version)
+	}
 	// Hand-built rather than encoding/json: this has to be writable onto a raw net.Conn in the
 	// tunnel path, and the shape is fixed. Values are quoted through strconv so a hostile Host
 	// header cannot break out of the document.
@@ -193,10 +266,48 @@ func refusalJSON(d Decision, host string, version int64) []byte {
 `, strconv.Quote(d.Kind), strconv.Quote(host), strconv.Quote(d.Reason), version, strconv.Quote(refusalFix))
 }
 
+// supplyRefusalJSON is the body for a package the blocklist refused, and it is the entire UX of that
+// feature.
+//
+// This is what a developer reads in `npm install` output at the moment their build stops, so it has
+// to answer all four questions at once: what was refused, why, on whose authority, and what to do
+// next. A refusal that names none of those gets worked around — a pinned old version, a registry
+// mirror, `--ignore-scripts`, an argument with the platform team — and the control is then off in
+// practice while still reporting itself as on.
+func supplyRefusalJSON(d Decision, host string, policyVersion int64) []byte {
+	h := d.Supply
+	fix := "ask an admin to add an exception under Supply chain in the deter console, if this package " +
+		"is genuinely needed"
+	if h.FixedIn != "" {
+		fix = "upgrade to " + h.FixedIn + " — or, if that is not possible yet, ask an admin for an " +
+			"exception under Supply chain in the deter console"
+	}
+	return fmt.Appendf(nil, `{
+  "error": "package_blocked",
+  "decision": %s,
+  "host": %s,
+  "reason": %s,
+  "package": %s,
+  "package_version": %s,
+  "advisory": %s,
+  "severity": %s,
+  "fixed_in": %s,
+  "kev": %t,
+  "blocked_because": %s,
+  "policy_version": %d,
+  "blocklist_version": %d,
+  "fix": %s
+}
+`, strconv.Quote(d.Kind), strconv.Quote(host), strconv.Quote(d.Reason),
+		strconv.Quote(h.Package), strconv.Quote(h.Version), strconv.Quote(h.Advisory),
+		strconv.Quote(h.Severity), strconv.Quote(h.FixedIn), h.KEV, strconv.Quote(h.Reason),
+		policyVersion, h.BlocklistVersion, strconv.Quote(fix))
+}
+
 // refusalHeader carries the same facts as the body, for anything reading headers rather than parsing
 // a body it did not expect.
 func refusalHeader(d Decision, host string, version int64) http.Header {
-	return http.Header{
+	hdr := http.Header{
 		"Content-Type":           []string{"application/json"},
 		"X-Deter-Decision":       []string{d.Kind},
 		"X-Deter-Host":           []string{host},
@@ -204,6 +315,21 @@ func refusalHeader(d Decision, host string, version int64) http.Header {
 		// Nothing here is worth caching, and a cached 403 would outlive the policy edit that fixes it.
 		"Cache-Control": []string{"no-store"},
 	}
+	// The same facts as the body, for a package manager or a log scraper that reads headers rather
+	// than parsing a body it did not expect to be JSON.
+	if s := d.Supply; s != nil {
+		if s.Package != "" {
+			hdr.Set("X-Deter-Package", s.Package+"@"+s.Version)
+		}
+		if s.Advisory != "" {
+			hdr.Set("X-Deter-Advisory", s.Advisory)
+		}
+		if s.FixedIn != "" {
+			hdr.Set("X-Deter-Fixed-In", s.FixedIn)
+		}
+		hdr.Set("X-Deter-Blocklist-Version", fmt.Sprint(s.BlocklistVersion))
+	}
+	return hdr
 }
 
 // writeRefusal answers on a ResponseWriter — the plain-HTTP proxy path.
@@ -381,6 +507,16 @@ func (p *proxy) serveTunnel(conn net.Conn, tunnelHost, tunnelPort string) {
 			// Written straight onto the connection, since there is no ResponseWriter in here.
 			_ = p.refusalResponse(d, host).Write(conn)
 			return
+		}
+
+		// This is the request the whole feature exists for: TLS is terminated, so the exact tarball
+		// URL is visible, which is what lets `registry.npmjs.org` stay reachable while one
+		// compromised release of one package does not.
+		if sd, ok := p.checkSupply(host, match); ok {
+			if !p.record(sd, host, req.Method, match) {
+				_ = p.refusalResponse(sd, host).Write(conn)
+				return
+			}
 		}
 
 		res, err := p.roundTrip(req, upstreamURL("https", host, port, forward, match, req.URL.RawQuery))

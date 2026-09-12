@@ -99,7 +99,7 @@ func TestGuardServerListensAndKeepsOrRemovesItsCA(t *testing.T) {
 	// removeCA=true is the exec shape: nobody outside the process was told where the CA is.
 	dir := t.TempDir()
 	caPath := filepath.Join(dir, "ca.pem")
-	g, err := startGuard(pol, nil, ModeEnforce, "127.0.0.1", 0, caPath, true, false)
+	g, err := startGuard(pol, nil, nil, ModeEnforce, "127.0.0.1", 0, caPath, true, false)
 	if err != nil {
 		t.Fatalf("startGuard: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestGuardServerListensAndKeepsOrRemovesItsCA(t *testing.T) {
 	// deleting it would break a container that is still running.
 	dir2 := t.TempDir()
 	caPath2 := filepath.Join(dir2, "ca.pem")
-	g2, err := startGuard(pol, nil, ModeEnforce, "127.0.0.1", 0, caPath2, false, false)
+	g2, err := startGuard(pol, nil, nil, ModeEnforce, "127.0.0.1", 0, caPath2, false, false)
 	if err != nil {
 		t.Fatalf("startGuard: %v", err)
 	}

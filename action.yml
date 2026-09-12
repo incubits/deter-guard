@@ -82,6 +82,15 @@ inputs:
       measuring. Refused hosts arrive as warning annotations rather than errors.
     required: false
     default: "enforce"
+  supply-chain:
+    description: >-
+      Block packages your organization's signed blocklist refuses — known-malicious releases, and
+      vulnerabilities at or above the threshold set in the console. On by default. Set `false` to
+      pull the egress policy only. This never fails open into a broken build: an unreachable or
+      unpublished blocklist means package blocking does not happen on that run, loudly, and the
+      egress policy is unaffected.
+    required: false
+    default: "true"
   verbose:
     description: Log allowed requests too, not just refusals.
     required: false

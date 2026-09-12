@@ -73,6 +73,19 @@ type Decision struct {
 	// one refusal it must not — there is nothing to let it through TO. Kept off the wire vocabulary
 	// deliberately: to the console this is still a `deny_policy`, because that is what it is.
 	Malformed bool
+
+	// Observe marks a decision that is RECORDED but not applied, whatever mode the guard is in.
+	//
+	// The guard's own --mode is a property of the run; this is a property of one decision, and the
+	// two are independent. An organization can have malware on `enforce` and vulnerabilities on
+	// `monitor` in the same document, and an advisory with no fixed version is reported rather than
+	// blocked by default — because blocking it leaves the developer nowhere to go. Those all arrive
+	// here as refusals that must not refuse.
+	Observe bool
+	// Supply carries the package a refusal is about, when it came from the supply-chain blocklist
+	// rather than the egress policy. It is what the 403 body is built from — see supplychain.go, and
+	// note that the body IS the feature: it is what a developer reads in `npm install` output.
+	Supply *supplyHit
 }
 
 // hostMatches supports an exact name and a leading-`*.` wildcard.

@@ -50,9 +50,19 @@ type policyResponse struct {
 
 func baseURL(u string) string { return strings.TrimRight(strings.TrimSpace(u), "/") }
 
+// maxResponseBytes is the ceiling on an ordinary JSON reply. Generous for an API answer and low
+// enough that a console serving something enormous cannot exhaust a runner's memory.
+const maxResponseBytes = 8 << 20
+
 // call performs one request and decodes into out. Headers are MERGED, not replaced — dropping the
 // caller's x-deter-* headers silently un-attributes a run from its project.
 func call(ctx context.Context, method, url, token string, body any, headers map[string]string, out any) error {
+	return callLimited(ctx, method, url, token, body, headers, out, maxResponseBytes)
+}
+
+// callLimited is call with an explicit response ceiling, for the one endpoint whose answer is a
+// multi-megabyte document rather than an API reply — see supplychainpull.go.
+func callLimited(ctx context.Context, method, url, token string, body any, headers map[string]string, out any, maxBytes int64) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -83,7 +93,7 @@ func call(ctx context.Context, method, url, token string, body any, headers map[
 	}
 	defer res.Body.Close()
 
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, maxBytes))
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var e struct {
 			Error   string `json:"error"`

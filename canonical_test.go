@@ -307,7 +307,7 @@ func TestPoisonedHostHeaderNeverReachesTheNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &dialRecorder{}
-	px := newProxy(&Policy{Version: 7, Rules: []Rule{{Host: "*.example.com"}}}, ca, nil, ModeEnforce, false)
+	px := newProxy(&Policy{Version: 7, Rules: []Rule{{Host: "*.example.com"}}}, nil, ca, nil, ModeEnforce, false)
 	px.upstream.DialContext = rec.dial
 	px.upstream.DialTLSContext = rec.dial
 
@@ -350,7 +350,7 @@ func TestPermittedRequestStillReachesTheNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &dialRecorder{}
-	px := newProxy(&Policy{Version: 7, Rules: []Rule{{Host: "*.example.com"}}}, ca, nil, ModeEnforce, false)
+	px := newProxy(&Policy{Version: 7, Rules: []Rule{{Host: "*.example.com"}}}, nil, ca, nil, ModeEnforce, false)
 	px.upstream.DialContext = rec.dial
 	px.upstream.DialTLSContext = rec.dial
 

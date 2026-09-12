@@ -3,6 +3,9 @@
 Egress control for CI. Fetches your organization's signed policy, verifies it, and runs your build
 behind a filtering proxy — so a blocklisted package is never downloaded.
 
+It pulls a **second** signed artifact alongside it: the packages your organization refuses to
+install, malicious or vulnerable. See [Blocking malicious and vulnerable packages](#blocking-malicious-and-vulnerable-packages).
+
 ```
 ghcr.io/incubits/deter-guard
 ```
@@ -72,6 +75,7 @@ npm error 403 Forbidden - GET https://registry.npmjs.org/left-pad/-/left-pad-1.3
 | `policy` | — | Local **unsigned** policy file to enforce instead of fetching one. |
 | `image` | matches the action's own ref | Image to take the binary from. Set it only to pull from a mirror of your own — see [Versions](#versions). |
 | `verify-attestation` | `true` | Verify the image's build provenance before using it. |
+| `supply-chain` | `true` | Block packages your organization's blocklist refuses. See [Blocking malicious and vulnerable packages](#blocking-malicious-and-vulnerable-packages). |
 | `verbose` | `false` | Log allowed requests too, not just refusals. |
 | `project` / `run-id` | — | For `dtrc_` tokens. Ignored when OIDC is available. |
 
@@ -127,6 +131,64 @@ silently does nothing.
 
 Matching on the path needs TLS interception, so a CA is generated in memory per run, written only
 where the build is told to trust it, and dies with the job.
+
+---
+
+## Blocking malicious and vulnerable packages
+
+Seeing the path is what makes this possible, so the guard also pulls the organization's signed
+**supply-chain document** and decides every tarball fetch against it. Nothing to configure: it is on
+by default wherever the guard already talks to a console.
+
+```
+deter-guard: supply-chain blocklist version 1789234440 verified against pinned key a092bf20…1b26d0f8
+deter-guard:   232994 entries · malware=enforce tail=enforce · cve=high/enforce+kev
+deter-guard: DENY  GET registry.npmjs.org/vite/-/vite-6.2.1.tgz — vite@6.2.1 is blocked —
+             GHSA-4r4m-qw57-chr8 (MODERATE): confirmed exploited in the wild (CISA KEV). Fixed in 6.2.4
+```
+
+**What it decides on.** Two matchers, because the corpus has two shapes:
+
+| | |
+| --- | --- |
+| **Malware** | Set membership. Either every version of a package is malicious (a typosquat) or one exact release of a real package is (the Shai-Hulud shape). No version arithmetic. |
+| **Vulnerabilities** | Semver **ranges**, evaluated here. Expanding ~9,900 range lines to concrete versions measures ~341,000 pairs — 34× larger, and stale the moment a version is published into an unfixed range. |
+
+**Only tarball fetches are decided.** Metadata requests stay allowed, or dependency resolution breaks
+long before it ever reaches the version that would be refused — and a blocklist that also broke
+`npm view` is one you'd switch off by the end of the week.
+
+**The posture travels with the data.** Thresholds, which classes enforce and which only report, the
+CISA KEV override, mirror prefixes — all of it is in the document's header. Moving your organization
+from `high` to `critical`, or excusing one pipeline, is a new document, not a new guard release. It
+is configured per surface in the console: CI and developer laptops are separate rows, because a red
+build is loud and fixed in minutes while a false block on a laptop stops someone working.
+
+### It fails **open**, loudly
+
+The egress policy fails closed — no policy means no egress, which is what an egress policy is for.
+This artifact is the opposite, deliberately. It changes every fifteen minutes as feeds move, and a
+console outage must not break every `npm ci` you run. So **every** failure here degrades package
+blocking, says so in the build log, and leaves the egress policy untouched:
+
+| | |
+| --- | --- |
+| Nothing published for your organization | One line. Package blocking is not in force. |
+| Console unreachable, or the pull fails | A warning. The build runs. |
+| Signature does not verify | A loud warning, and the document is **not** enforced. |
+| No key to verify against | Not enforced. Pin `--pubkey`, or use OIDC, which reports the key at exchange time. |
+| The document is older than your threshold | Enforced anyway, with a warning naming its age — unless your organization set `on_stale=block_registry`, which refuses the registry instead. |
+
+Turn it off entirely with `--no-supply-chain`, or `supply-chain: false` on the action.
+
+### Monitor and enforce, per class
+
+`--mode monitor` still outranks everything: nothing is blocked on that run, whatever the document
+says. Independently of that, your organization can put one class on `monitor` while another enforces
+— and an advisory with **no fixed version** is reported rather than blocked by default, because
+blocking a package with nowhere to upgrade to is how a control gets switched off wholesale instead of
+tuned. Those findings are counted separately in the end-of-run summary, so an enforcing run never
+implies it stopped something it let through.
 
 ---
 
@@ -362,6 +424,8 @@ Two things the action does that you now have to do yourself:
 | --- | --- |
 | `--mode <mode>` | `enforce` (default) refuses. `monitor` decides and reports the same way, and lets the request through. See [Monitor first, then enforce](#monitor-first-then-enforce). |
 | `--policy <path>` | Enforce a local policy file instead of fetching one. **Unsigned** — nothing is verified, and it says so on every run. |
+| `--no-supply-chain` | Do not pull or enforce the supply-chain blocklist. The egress policy is unaffected. |
+| `--supply-chain <path>` | Use a local supply-chain document instead of the console's. **Unsigned**, and it says so. Accepts the raw document or the bundle JSON the console serves. |
 | `--state-dir <dir>` | Where the CA the build must trust is written. Defaults to a temp dir. |
 | `--verbose` | Log allowed requests too, not just refusals. |
 
@@ -439,6 +503,33 @@ A real HTTP **403**, delivered inside the TLS session, naming the host and polic
   "fix": "permit this host in the deter console, under your organization's egress policy"
 }
 ```
+
+A package refused by the supply-chain blocklist answers with the same status and a body built to be
+read in `npm install` output — what, why, on whose authority, and where to go next:
+
+```json
+{
+  "error": "package_blocked",
+  "decision": "deny_supply_chain",
+  "host": "registry.npmjs.org",
+  "reason": "vite@6.2.1 is blocked — GHSA-4r4m-qw57-chr8 (MODERATE): confirmed exploited in the wild (CISA KEV). Fixed in 6.2.4",
+  "package": "vite",
+  "package_version": "6.2.1",
+  "advisory": "GHSA-4r4m-qw57-chr8",
+  "severity": "moderate",
+  "fixed_in": "6.2.4",
+  "kev": true,
+  "blocked_because": "kev",
+  "policy_version": 1787493039,
+  "blocklist_version": 1789234440,
+  "fix": "upgrade to 6.2.4 — or, if that is not possible yet, ask an admin for an exception under Supply chain in the deter console"
+}
+```
+
+The same facts are on `X-Deter-Package`, `X-Deter-Advisory` and `X-Deter-Fixed-In`. The fix named is
+the one for the **branch** the blocked version is on: an advisory spanning majors carries a fix per
+branch, and telling someone on 6.2.1 to "upgrade" to 4.5.11 is a downgrade across two majors — wrong
+advice in a denial is worse than none.
 
 Nothing is sent to the refused host — the tunnel is terminated here and never dialled onward. Under
 `--mode monitor` this response is never written: the same decision is logged and reported, and the
@@ -586,6 +677,8 @@ process is consulted, so nothing can opt out — shape 3's property without a se
 | `DETER_RUN_ID` | `--run` | Run id — deduplicates usage across retries. |
 | `DETER_MODE` | `--mode` | `enforce` (default) or `monitor`. |
 | `DETER_POLICY_FILE` | `--policy` | Enforce a local, **unsigned** policy file. |
+| `DETER_NO_SUPPLY_CHAIN` | `--no-supply-chain` | Do not block malicious or vulnerable packages at all. |
+| `DETER_SUPPLY_CHAIN_FILE` | `--supply-chain` | Use a local, **unsigned** supply-chain document instead of the console's. |
 | `DETER_STATE_DIR` | `--state-dir` | Where the CA and state file go. |
 | `DETER_GUARD_ADDR` | `--addr` | `serve` listen address. Default `127.0.0.1`. |
 | `DETER_GUARD_PORT` | `--port` | `serve` listen port. Default `3128`. |
@@ -642,9 +735,12 @@ Pin `sha-<commit>`, or the digest from the release notes, for an immutable refer
   it arrives is not.
 - **Certificate pinning.** Anything that pins a certificate breaks under interception by design.
   There's no way to filter it, and no allowlist for tunnelling it through uninspected yet.
-- **A blocklist feed.** The client already enforces `blocked` entries and the console serves the
-  field, but nothing populates it yet. Once a feed lands, every job picks it up on its next run with
-  no change here.
+- **Ecosystems other than npm.** The supply-chain document is ecosystem-prefixed and the corpus is
+  npm today, so PyPI, crates.io and Maven fetches are decided by the egress policy alone. The wire
+  format already carries the prefix; the tarball-path grammar for each is the work.
+- **Lockfile auditing.** Package blocking happens where packages are *fetched*, so a dependency
+  already in the store is never presented for a decision. An `audit` mode that reads the lockfile up
+  front — and reports findings as SARIF rather than as a failed install — is the other half.
 
 ## Development
 
