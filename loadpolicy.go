@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 )
 
@@ -55,9 +56,23 @@ func loadPolicyFile(path string) (*Policy, error) {
 // Returns the policy, the key the server claimed, and whether the signature was actually checked
 // against a pinned key. An unverified policy is still returned — a caller may legitimately run
 // unpinned on a first outing — but it must be told, so it can say so out loud.
-func fetchRules(ctx context.Context, consoleURL, token, pinned string, headers map[string]string) (*Policy, string, bool, error) {
+//
+// `mode` rides along on the pull, and it is the console's only chance to learn it. Pulling the
+// compiled rule set is what the console reads as "a guard stood in front of this build", because
+// nothing else asks for this encoding — and monitor mode pulls it for exactly the same reason
+// enforce mode does, since it makes the same decision. So a monitored repository registered as
+// enforcing, and the page an admin checks to see whether CI is covered answered yes for a build
+// that was letting everything through. Sending it costs one query parameter; not sending it makes
+// the console's most load-bearing claim a guess.
+//
+// Sent on every pull rather than only for monitor. The console reads an absent parameter as
+// enforcing — correct, since guards built before monitor mode existed only ever enforced — but that
+// makes silence mean two things, and the one time it matters is a monitoring guard too old to say
+// so. An explicit value never has that problem.
+func fetchRules(ctx context.Context, consoleURL, token, pinned string, headers map[string]string, mode Mode) (*Policy, string, bool, error) {
 	var r rulesResponse
-	err := call(ctx, http.MethodGet, baseURL(consoleURL)+"/api/ci/rules", token, nil, headers, &r)
+	url := baseURL(consoleURL) + "/api/ci/rules?mode=" + neturl.QueryEscape(string(mode))
+	err := call(ctx, http.MethodGet, url, token, nil, headers, &r)
 	if err != nil {
 		return nil, "", false, err
 	}
