@@ -73,6 +73,10 @@ function main() {
   // list of them here would be one more thing to keep in step. An unknown value fails the step with
   // the guard's own message.
   if (input('mode')) args.push('--mode', input('mode'))
+  // Package blocking is ON unless the caller says otherwise, and the input is worded that way round
+  // deliberately: a supply-chain control that has to be switched on is one most pipelines never
+  // switch on. Only an explicit `false` turns it off.
+  if (input('supply-chain') && !bool('supply-chain')) args.push('--no-supply-chain')
   if (bool('verbose')) args.push('--verbose')
 
   // Transparent mode needs to write firewall rules and the system trust store, so it runs under

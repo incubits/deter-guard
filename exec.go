@@ -57,6 +57,7 @@ func proxyEnv(proxyURL, caPath string) []string {
 
 type execOpts struct {
 	policy   *Policy
+	supply   *supplyChain
 	reporter *reporter
 	// Directory to write the CA into. Must be readable by the child.
 	stateDir string
@@ -80,7 +81,7 @@ func runExec(o execOpts) (int, error) {
 
 	// Port 0: let the kernel choose, so two jobs on one runner never collide. The CA is ours to
 	// delete afterwards — nobody outside this process was ever told where it is.
-	g, err := startGuard(o.policy, o.reporter, o.mode, "127.0.0.1", 0,
+	g, err := startGuard(o.policy, o.supply, o.reporter, o.mode, "127.0.0.1", 0,
 		filepath.Join(stateDir, "deter-guard-ca.pem"), true, o.verbose)
 	if err != nil {
 		return exitUsage, err
@@ -132,7 +133,22 @@ func runChild(argv []string, extraEnv []string, cred *dropCred) (int, error) {
 	return exitUsage, err
 }
 
-// resolvePolicy produces the policy the proxy will enforce, and the reporter to send refusals to.
+// enforcement is everything the proxy needs to decide a request: the two signed artifacts, and where
+// refusals go.
+//
+// A struct rather than four return values, because the two artifacts are independent — a run can have
+// a policy and no blocklist, which is the ordinary case for an organization that has not published
+// one — and a positional list of maybe-nils at two call sites is how one of them ends up dropped.
+type enforcement struct {
+	policy *Policy
+	// nil means package blocking is not in force on this run. Always an acceptable outcome; never a
+	// silent one. See resolveSupplyChain.
+	supply   *supplyChain
+	reporter *reporter
+}
+
+// resolvePolicy produces the policy the proxy will enforce, the supply-chain blocklist beside it,
+// and the reporter to send refusals to.
 //
 // Shared by `exec` and `serve`, which must not differ on any of this. In particular the reporter is
 // constructed in exactly one branch — the console one — so a local --policy file gets enforcement
@@ -145,19 +161,22 @@ func runChild(argv []string, extraEnv []string, cred *dropCred) (int, error) {
 //
 // The int is the exit code to use when err is non-nil, so callers do not have to re-derive whether a
 // failure was configuration, authentication, or a signature that did not verify.
-func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
+func resolvePolicy(o opts) (enforcement, int, error) {
 	if o.policyFile != "" {
 		p, err := loadPolicyFile(o.policyFile)
 		if err != nil {
-			return nil, nil, exitUsage, err
+			return enforcement{}, exitUsage, err
 		}
 		logf("policy from %s (UNSIGNED — no console, nothing verified)", o.policyFile)
 		warnIfPermitsNothing(p, o.mode)
-		return p, nil, exitOK, nil
+		// A local policy has no console to pull a blocklist from, so only --supply-chain can supply
+		// one here. resolveSupplyChain returns nil for everything else, which is the right answer.
+		return enforcement{policy: p, supply: resolveSupplyChain(context.Background(), o, "", "", false, nil)},
+			exitOK, nil
 	}
 
 	if o.consoleURL == "" {
-		return nil, nil, exitUsage, errors.New(
+		return enforcement{}, exitUsage, errors.New(
 			"no console URL — pass --console, set DETER_CONSOLE_URL, or use --policy <file>")
 	}
 
@@ -166,7 +185,7 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 
 	token, how, sessionKey, err := authenticate(ctx, o)
 	if err != nil {
-		return nil, nil, exitAuth, fmt.Errorf("authentication failed: %w", err)
+		return enforcement{}, exitAuth, fmt.Errorf("authentication failed: %w", err)
 	}
 
 	headers := map[string]string{}
@@ -189,9 +208,9 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 	if err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) && ae.Status < 500 {
-			return nil, nil, exitAuth, err
+			return enforcement{}, exitAuth, err
 		}
-		return nil, nil, exitUnverified, err
+		return enforcement{}, exitUnverified, err
 	}
 	if verified {
 		logf("policy version %d verified against pinned key %s (via %s)",
@@ -203,7 +222,17 @@ func resolvePolicy(o opts) (*Policy, *reporter, int, error) {
 
 	warnIfPermitsNothing(p, o.mode)
 	rep := newReporter(baseURL(o.consoleURL)+"/api/report/attempts", token, headers, o.mode)
-	return p, rep, exitOK, nil
+
+	// The blocklist is verified against the SAME key as the policy, resolved in the same order. The
+	// last of those — the key the console served alongside the rules — proves only that the two
+	// artifacts are internally consistent, which is why both pulls say so in the same words.
+	key := pinned
+	if key == "" {
+		key = served
+	}
+	sc := resolveSupplyChain(ctx, o, token, key, verified, headers)
+
+	return enforcement{policy: p, supply: sc, reporter: rep}, exitOK, nil
 }
 
 // warnIfPermitsNothing names the one policy that is valid, blocks everything, and looks like a bug.
@@ -228,15 +257,16 @@ func runExecCommand(o opts, argv []string) int {
 		return exitUsage
 	}
 
-	pol, rep, code, err := resolvePolicy(o)
+	e, code, err := resolvePolicy(o)
 	if err != nil {
 		errf("%s", err)
 		return code
 	}
 
 	code, err = runExec(execOpts{
-		policy:   pol,
-		reporter: rep,
+		policy:   e.policy,
+		supply:   e.supply,
+		reporter: e.reporter,
 		stateDir: o.stateDir,
 		mode:     o.mode,
 		verbose:  o.verbose,

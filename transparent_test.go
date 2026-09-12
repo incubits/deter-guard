@@ -32,7 +32,7 @@ func transparentFixture(t *testing.T, p *Policy, origin *httptest.Server, mode M
 	if err != nil {
 		t.Fatal(err)
 	}
-	px = newProxy(p, ca, nil, mode, false)
+	px = newProxy(p, nil, ca, nil, mode, false)
 
 	originRoot := x509.NewCertPool()
 	originRoot.AddCert(origin.Certificate())

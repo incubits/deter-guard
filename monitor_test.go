@@ -83,7 +83,7 @@ func TestMonitorForwardsWhatEnforceRefuses(t *testing.T) {
 		if strings.Contains(body, "tarball:") {
 			t.Error("the origin was reached anyway")
 		}
-		if list, _, _ := px.summary(); len(list) != 1 {
+		if list, _, _, _ := px.summary(); len(list) != 1 {
 			t.Fatalf("want one refusal in the summary, got %d", len(list))
 		}
 	})
@@ -103,7 +103,7 @@ func TestMonitorForwardsWhatEnforceRefuses(t *testing.T) {
 
 		// Allowing it through is only half the mode. Losing the refusal would make the run useless:
 		// there would be nothing to take to the console at the end of it.
-		list, _, _ := px.summary()
+		list, _, _, _ := px.summary()
 		if len(list) != 1 {
 			t.Fatalf("want one recorded refusal, got %d: %+v", len(list), list)
 		}
@@ -144,7 +144,7 @@ func TestMonitorLearnsThePathsBehindARefusedHost(t *testing.T) {
 		t.Fatalf("monitor mode must not refuse an unpermitted host: got %d %q", code, body)
 	}
 
-	list, _, _ := px.summary()
+	list, _, _, _ := px.summary()
 	var sawConnect, sawPath bool
 	for _, r := range list {
 		switch {
@@ -169,7 +169,7 @@ func TestMonitorLearnsThePathsBehindARefusedHost(t *testing.T) {
 // there is nothing to forward it to — and a proxy that tried would be guessing where to send bytes
 // on behalf of a build.
 func TestMonitorStillRefusesWhatItCannotIdentify(t *testing.T) {
-	px := newProxy(&Policy{Rules: []Rule{{Host: "ok.example.com"}}}, nil, nil, ModeMonitor, false)
+	px := newProxy(&Policy{Rules: []Rule{{Host: "ok.example.com"}}}, nil, nil, nil, ModeMonitor, false)
 
 	for _, d := range []Decision{
 		malformedHost,
@@ -189,7 +189,7 @@ func TestMonitorStillRefusesWhatItCannotIdentify(t *testing.T) {
 
 // A retry loop is one line in the summary, not four hundred.
 func TestSummaryCollapsesRetriesAndCountsAllows(t *testing.T) {
-	px := newProxy(&Policy{}, nil, nil, ModeEnforce, false)
+	px := newProxy(&Policy{}, nil, nil, nil, ModeEnforce, false)
 	deny := Decision{Kind: "deny_policy", Reason: "host not permitted by the egress policy"}
 
 	for i := 0; i < 3; i++ {
@@ -198,7 +198,7 @@ func TestSummaryCollapsesRetriesAndCountsAllows(t *testing.T) {
 	px.record(deny, "bad.example.com", "GET", "/b")
 	px.record(Decision{Allow: true, Kind: "allow"}, "ok.example.com", "GET", "/fine")
 
-	list, allowed, dropped := px.summary()
+	list, allowed, _, dropped := px.summary()
 	if len(list) != 2 {
 		t.Fatalf("want two distinct targets, got %d", len(list))
 	}
@@ -242,7 +242,7 @@ func TestTransparentMonitorForwardsARefusedHost(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("got %d, want the request to reach the origin", res.StatusCode)
 	}
-	if list, _, _ := px.summary(); len(list) == 0 {
+	if list, _, _, _ := px.summary(); len(list) == 0 {
 		t.Error("nothing was recorded, so the run produced no reason to change the policy")
 	}
 }

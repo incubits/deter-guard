@@ -85,6 +85,12 @@ func (p *proxy) tally(d Decision, host, method, path string) {
 		p.allowed++
 		return
 	}
+	// A finding the ORGANIZATION set to report rather than block, in a run that is otherwise
+	// enforcing. Counted apart from the rest so the end-of-run summary cannot imply that everything
+	// it lists was stopped — see logSummary.
+	if d.Observe && p.mode != ModeMonitor {
+		p.observed++
+	}
 	k := refusalKey{host, method, path}
 	if r, ok := p.refusals[k]; ok {
 		r.count++
@@ -102,13 +108,13 @@ func (p *proxy) tally(d Decision, host, method, path string) {
 //
 // First-seen order rather than sorted by count: the first thing a build was refused is usually the
 // one that caused everything after it, and a frequency sort buries it under the retries.
-func (p *proxy) summary() (list []refusal, allowed, dropped int64) {
+func (p *proxy) summary() (list []refusal, allowed, observed, dropped int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, k := range p.order {
 		list = append(list, *p.refusals[k])
 	}
-	return list, p.allowed, p.summaryDropped
+	return list, p.allowed, p.observed, p.summaryDropped
 }
 
 // logSummary prints what the policy did over the whole run, once, at the end.
@@ -117,7 +123,7 @@ func (p *proxy) summary() (list []refusal, allowed, dropped int64) {
 // own they are evidence rather than an answer. This is the answer: the list to go and permit, or the
 // confirmation that there is nothing to permit and the policy is ready to enforce.
 func (p *proxy) logSummary() {
-	list, allowed, dropped := p.summary()
+	list, allowed, observed, dropped := p.summary()
 
 	var total int64
 	for _, r := range list {
@@ -151,6 +157,14 @@ func (p *proxy) logSummary() {
 	if dropped > 0 {
 		logf("  (%d further distinct target(s) went uncounted past the %d-target cap)",
 			dropped, maxSummaryTargets)
+	}
+	if observed > 0 && p.mode != ModeMonitor {
+		// An enforcing run that nevertheless let some of these through, because the organization put
+		// that class of finding on `monitor` — or because the advisory has no fixed version yet, and
+		// blocking a package with nowhere to upgrade to is how a control gets switched off wholesale.
+		// A summary that counted those as stopped would be reporting protection that did not happen.
+		logf("  (%d of those were REPORTED ONLY and did install — your organization has that class "+
+			"of finding on monitor, or the advisory has no fix yet)", observed)
 	}
 
 	if p.mode == ModeMonitor {
