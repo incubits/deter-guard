@@ -255,6 +255,13 @@ type supplyChain struct {
 	pinned map[uint64]string   // hash("npm/name@version")  → advisory id
 	vulns  map[uint64][]scVuln // hash("npm/name")          → the ranges for it
 
+	// dropped is entry lines for an ecosystem this guard DOES enforce that it could not read, and
+	// skipped is lines for an ecosystem it does not. The difference is the whole point of counting
+	// them: `skipped` is a stated limit, `dropped` is this parser disagreeing with the console about
+	// the format, which is the failure that hides. See warnIfUnreadable.
+	dropped int
+	skipped int
+
 	// Verified reports whether the signature was checked against a key the guard PINNED, rather
 	// than one the same response handed it. Only one of those is a security claim.
 	Verified bool
@@ -305,13 +312,20 @@ func scHash(s string) uint64 {
 //	# corpus=2026-09-12T16:00:00Z sources=osv,cisa-kev entries=254014
 //
 //	!npm/@evil/pkg                                    every version malicious
-//	=npm/@ctrl/tinycolor@4.1.1:MAL-2025-47141         one compromised release
-//	~npm/vite:6.2.0:6.2.3::M:GHSA-4r4m-qw57-chr8:kev  a vulnerable RANGE
-//	+npm/lodash@4.17.20:H:GHSA-35jh-r3h4-6jhm:fix=4.17.21   an enumerated affected version
+//	=npm/@ctrl/tinycolor@4.1.1|MAL-2025-47141         one compromised release
+//	~npm/vite|6.2.0|6.2.3||M|GHSA-4r4m-qw57-chr8|kev  a vulnerable RANGE
+//	+npm/lodash@4.17.20|H|GHSA-35jh-r3h4-6jhm|fix=4.17.21   an enumerated affected version
 //
 // An unreadable ENTRY is skipped, because one malformed line out of 250k must not cost the other
 // 249,999. An unreadable HEADER is fatal: the header is the posture, and enforcing a quarter of a
 // million entries under a posture nobody could read is worse than enforcing none of them.
+//
+// Skipping is counted, though, and that is not bookkeeping. This parser read `:` where the console
+// had moved to `|`, so every pinned release and every CVE in the document failed to parse and was
+// dropped one line at a time, in silence; the typosquat tail carries no separator, so it still
+// parsed, the guard still logged a healthy-looking entry count, and CI enforced a fraction of the
+// posture it reported. A control that fails this way is worse than one that is off, because nobody
+// goes looking. warnIfUnreadable is what makes that noisy now.
 func parseSupplyChainDoc(doc string, version int64) (*supplyChain, error) {
 	sc := &supplyChain{
 		Version: version,
@@ -420,31 +434,88 @@ func splitList(s string) []string {
 	return out
 }
 
-// addEntry parses one entry line into the index. A line it cannot read is dropped, silently and
-// deliberately: see parseSupplyChainDoc.
+// enforceableEcosystems are the ecosystems this guard can identify from a request URL, and so the
+// only ones whose entries are worth keeping.
+//
+// The console compiles EIGHT ecosystems into one document. This guard reads npm tarball paths and
+// nothing else (see parseRegistryPath), and the lookup key is `<ecosystem>/<name>` — so a PyPI or
+// Maven entry is one nothing here can ever ask for. Holding them would cost a CI container hundreds
+// of megabytes to answer a question it cannot pose. The Rust broker drops unknown ecosystems for the
+// same reason, and for the same reason keeps its own entry count honest about what is enforceable.
+//
+// This set and parseRegistryPath are ONE decision written in two places: widen either without the
+// other and the guard stores entries nothing looks up, or looks up entries that were never stored.
+var enforceableEcosystems = map[string]bool{"npm": true}
+
+// entryEcosystem reads the `<ecosystem>/` prefix every entry line opens with.
+//
+// Cut at the FIRST `/`: an npm scope (`npm/@ctrl/tinycolor`) and a Go module path
+// (`Go/github.com/foo/bar`) both carry more, and only the first segment is the ecosystem.
+func entryEcosystem(body string) (string, bool) {
+	eco, _, ok := strings.Cut(body, "/")
+	if !ok || eco == "" {
+		return "", false
+	}
+	return eco, true
+}
+
+// addEntry parses one entry line into the index.
+//
+// Fields are `|`-separated, NOT `:`. Maven package names ARE `group:artifact` coordinates, so a
+// colon separator splits the name in half and no Maven advisory can ever match; `|` is not valid in
+// a package name in any ecosystem the console ships. This is the same grammar the Rust broker reads
+// (broker/src/supply_chain.rs) and the one the console writes (supplychain/compile.ts).
+//
+// A line it cannot read is dropped and COUNTED — silently dropping them is what let this parser
+// spend a release reading `:` while the console wrote `|`, enforcing typosquats and nothing else.
+// See parseSupplyChainDoc.
 func (sc *supplyChain) addEntry(line string) {
+	switch line[0] {
+	case '!', '=', '~', '+':
+	default:
+		// An entry shape this build does not know. Counted as unreadable rather than ignored: if the
+		// console grows a kind of entry that carries real blocks, silence is the wrong answer — that
+		// is the whole lesson of the separator change.
+		sc.dropped++
+		return
+	}
+
+	body := line[1:]
+	eco, ok := entryEcosystem(body)
+	if !ok {
+		sc.dropped++
+		return
+	}
+	if !enforceableEcosystems[eco] {
+		// Not drift — a deliberate, stated limit. Counted separately so the two can never be
+		// confused for one another in the one line an operator reads.
+		sc.skipped++
+		return
+	}
+
 	switch line[0] {
 	case '!':
 		// !npm/@evil/pkg — every version malicious. No advisory id, and that is measured rather than
 		// missing: attaching one to ~208k high-entropy lines costs 0.56 MB gzipped and buys nothing
 		// a developer can act on, because a tail hit means the whole package is malware.
-		if key := strings.TrimSpace(line[1:]); key != "" {
+		if key := strings.TrimSpace(body); key != "" {
 			sc.tail[scHash(key)] = struct{}{}
+			return
 		}
 	case '=':
-		// =npm/@ctrl/tinycolor@4.1.1:MAL-2025-47141 — one compromised release of a real package.
+		// =npm/@ctrl/tinycolor@4.1.1|MAL-2025-47141 — one compromised release of a real package.
 		// The id stays here because this is the case a developer looks up, and the id is what makes
 		// the message credible.
-		key, advisory, ok := strings.Cut(line[1:], ":")
-		if !ok || strings.TrimSpace(key) == "" {
+		key, advisory, ok := strings.Cut(body, "|")
+		if ok && strings.TrimSpace(key) != "" {
+			sc.pinned[scHash(strings.TrimSpace(key))] = strings.TrimSpace(advisory)
 			return
 		}
-		sc.pinned[scHash(strings.TrimSpace(key))] = strings.TrimSpace(advisory)
 	case '~':
-		// ~npm/vite:6.2.0:6.2.3::M:GHSA-4r4m-qw57-chr8:kev,fix=6.2.4
-		parts := strings.SplitN(line[1:], ":", 7)
+		// ~npm/vite|6.2.0|6.2.3||M|GHSA-4r4m-qw57-chr8|kev,fix=6.2.4
+		parts := strings.SplitN(body, "|", 7)
 		if len(parts) < 6 {
-			return
+			break
 		}
 		v := scVuln{
 			Introduced: parts[1],
@@ -464,24 +535,27 @@ func (sc *supplyChain) addEntry(line string) {
 		}
 		if pkg := strings.TrimSpace(parts[0]); pkg != "" {
 			sc.vulns[scHash(pkg)] = append(sc.vulns[scHash(pkg)], v)
+			return
 		}
 	case '+':
-		// +npm/lodash@4.17.20:H:GHSA-35jh-r3h4-6jhm:fix=4.17.21 — OSV enumerated the version instead
+		// +npm/lodash@4.17.20|H|GHSA-35jh-r3h4-6jhm|fix=4.17.21 — OSV enumerated the version instead
 		// of giving a range.
-		parts := strings.SplitN(line[1:], ":", 4)
+		parts := strings.SplitN(body, "|", 4)
 		if len(parts) < 3 {
-			return
+			break
 		}
 		pkg, ver, ok := cutLast(parts[0], "@")
 		if !ok || pkg == "" || ver == "" {
-			return
+			break
 		}
 		v := scVuln{Version: ver, Severity: parseBandChar(parts[1]), Advisory: parts[2], EPSS: -1}
 		if len(parts) == 4 {
 			applyFlags(&v, parts[3])
 		}
 		sc.vulns[scHash(pkg)] = append(sc.vulns[scHash(pkg)], v)
+		return
 	}
+	sc.dropped++
 }
 
 // applyFlags reads the optional comma-separated tail of a vulnerability line.
