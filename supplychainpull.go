@@ -100,6 +100,7 @@ func resolveSupplyChain(ctx context.Context, o opts, token, key string, pinned b
 		}
 		logf("supply-chain blocklist from %s (UNSIGNED — nothing verified), %s",
 			o.supplyFile, sc.describe())
+		sc.warnIfUnreadable()
 		return sc
 	}
 	if o.consoleURL == "" || token == "" {
@@ -165,6 +166,7 @@ func resolveSupplyChain(ctx context.Context, o opts, token, key string, pinned b
 		logf("supply-chain blocklist version %d verified against the key the CONSOLE SERVED (%s) · "+
 			"%s — pin --pubkey to make this a real check", b.Version, keyFingerprint(key), sc.describe())
 	}
+	sc.warnIfUnreadable()
 	sc.warnIfStale(time.Now())
 	return sc
 }
@@ -173,8 +175,15 @@ func resolveSupplyChain(ctx context.Context, o opts, token, key string, pinned b
 // not just the fact that a document arrived.
 func (sc *supplyChain) describe() string {
 	p := sc.Posture
+	entries := fmt.Sprintf("%d entries", len(sc.tail)+len(sc.pinned)+sc.vulnLines())
+	// The console compiles eight ecosystems into one document and this guard enforces npm. Saying
+	// only what was KEPT would report a number far below the header's and invite exactly the wrong
+	// conclusion — that most of the document failed to parse.
+	if sc.skipped > 0 {
+		entries += fmt.Sprintf(" (+%d for ecosystems this guard cannot match to a download URL)", sc.skipped)
+	}
 	parts := []string{
-		fmt.Sprintf("%d entries", len(sc.tail)+len(sc.pinned)+sc.vulnLines()),
+		entries,
 		fmt.Sprintf("malware=%s tail=%s", p.Malware, p.Tail),
 	}
 	if p.CVEAction == scOff {
@@ -198,6 +207,34 @@ func (sc *supplyChain) vulnLines() int {
 		n += len(v)
 	}
 	return n
+}
+
+// warnIfUnreadable says so when entry lines did not parse.
+//
+// The failure this exists for: the console changed the document's field separator from `:` to `|`
+// and this parser did not, so every pinned malware release and every CVE range was dropped as
+// malformed while the typosquat tail — which has no separator — kept parsing. The guard logged an
+// entry count that looked fine and enforced a sliver of the posture it had just reported.
+//
+// Dropping the odd malformed line out of 250k is ordinary and stays quiet. Dropping a PERCENT of
+// them is not a bad line, it is a grammar this build cannot read, and it is reported as what it
+// costs: the blocklist is still enforced, because the part that parsed is real protection, but an
+// operator is told the rest of it is not in force.
+func (sc *supplyChain) warnIfUnreadable() {
+	if sc.dropped == 0 {
+		return
+	}
+	readable := len(sc.tail) + len(sc.pinned) + sc.vulnLines()
+	total := readable + sc.dropped
+	// 1%. Below that it is bad lines in a feed; at or above it, the console and this guard disagree
+	// about the format itself.
+	if total > 0 && sc.dropped*100 >= total {
+		errf("%d of %d supply-chain entries could not be parsed — this guard does not understand "+
+			"the format the console published. Only the %d that parsed are in force; the rest are "+
+			"NOT blocked in this build. Upgrade deter-guard.", sc.dropped, total, readable)
+		return
+	}
+	logf("%d supply-chain entries were unreadable and are not in force (%d are)", sc.dropped, readable)
 }
 
 // age is how old the document's data is. Zero when the header carried no timestamp.

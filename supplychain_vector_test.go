@@ -14,6 +14,12 @@ package main
 // than in the field.
 //
 // The signing key is the RFC 8032 test key, the same one rules_vector_test.go uses.
+//
+// Regenerate both the document and the signature with testdata/generate-vector.mts, against a
+// deter-console checkout — never by editing the bytes below. This vector went stale exactly once, in
+// the way the paragraph above predicted: the console moved the entry separator from `:` to `|` and
+// this file, being hand-maintained from then on, kept asserting the old grammar. The suite passed,
+// and the guard shipped a parser that read one entry in six out of a real document.
 
 import (
 	"strings"
@@ -23,18 +29,19 @@ import (
 const (
 	scVecVersion = int64(1789234440)
 	scVecPub     = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-	scVecSig     = "bdd82d9d18f4dd65415ac430c73c1d877e92f5cb024265a71124a7cd2c6705e2bd5a2e0e9e36576e8d9a40dc85f3a66179ccad3080e208e353bab3b3de02a902"
+	scVecSig     = "a6d558c2e351d4524375fab047428aa7b1f1fc61e386806a7a7cbaa4945da65376bd19e60f84c2242384e2c2e197ca48b0848bc46078185a98679d420643e406"
 	scVecDoc     = `# deter-supply-chain v1
 # generated=2026-09-12T16:34:00.000Z scope=ci
 # malware=enforce tail=enforce cve=high action=enforce kev=on unfixed=report stale=warn:24h
+# ecosystems=npm
 # registries=registry.npmjs.org,registry.yarnpkg.com,npm.pkg.github.com
 # corpus=2026-09-12T16:00:00.000Z sources=osv,cisa-kev entries=6
 !npm/reqeusts
-=npm/@ctrl/tinycolor@4.1.1:MAL-2025-47141
-~npm/abandoned-pkg:1.0.0:::C:GHSA-0000-nofix-0000:nofix
-~npm/lodash:0::4.17.20:H:GHSA-35jh-r3h4-6jhm:fix=4.17.21
-~npm/vite:4.0.0:4.5.11::M:GHSA-4r4m-qw57-chr8:kev,fix=4.5.11,epss=0.412
-~npm/vite:6.2.0:6.2.4::M:GHSA-4r4m-qw57-chr8:kev,fix=6.2.4,epss=0.412
+=npm/@ctrl/tinycolor@4.1.1|MAL-2025-47141
+~npm/abandoned-pkg|1.0.0|||C|GHSA-0000-nofix-0000|nofix
+~npm/lodash|0||4.17.20|H|GHSA-35jh-r3h4-6jhm|fix=4.17.21
+~npm/vite|4.0.0|4.5.11||M|GHSA-4r4m-qw57-chr8|kev,fix=4.5.11,epss=0.412
+~npm/vite|6.2.0|6.2.4||M|GHSA-4r4m-qw57-chr8|kev,fix=6.2.4,epss=0.412
 `
 )
 

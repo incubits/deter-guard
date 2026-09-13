@@ -1,0 +1,15 @@
+# deter-supply-chain v1
+# generated=2026-09-13T10:00:00.000Z scope=ci
+# malware=enforce tail=enforce cve=high action=enforce kev=on unfixed=report stale=warn:24h
+# ecosystems=Maven,NuGet,PyPI,npm
+# registries=registry.npmjs.org,registry.yarnpkg.com,npm.pkg.github.com,files.pythonhosted.org,pypi.org,proxy.golang.org,repo1.maven.org,repo.maven.apache.org,central.sonatype.com,static.crates.io,crates.io,rubygems.org,api.nuget.org
+# corpus=2026-09-13T09:00:00.000Z sources=osv,cisa-kev,epss entries=9
+!PyPI/requests-toolbelt-evil
+!npm/evil-typosquat
+=NuGet/newtonsoft.json.evil@1.0.0|MAL-2025-0003
+=npm/@ctrl/tinycolor@4.1.1|MAL-2025-47141
++npm/lodash@4.17.20|H|GHSA-35jh-r3h4-6jhm|fix=4.17.21
+~Maven/org.apache.logging.log4j:log4j-core|2.0.0|2.17.1||C|GHSA-mvn-1|kev,fix=2.17.1,epss=0.970
+~PyPI/requests|2.0.0|2.31.0||H|GHSA-py-1|fix=2.31.0
+~npm/abandoned-pkg|1.0.0|||C|GHSA-abandoned|nofix
+~npm/vite|6.2.0|6.2.4||M|GHSA-4r4m-qw57-chr8|kev,fix=6.2.4,epss=0.420

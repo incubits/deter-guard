@@ -32,10 +32,10 @@ func TestOneUnreadableLineDoesNotCostTheOtherTwoHundredThousand(t *testing.T) {
 	doc := "# deter-supply-chain v1\n" +
 		"# registries=registry.npmjs.org\n" +
 		"!npm/good-catch\n" +
-		"~npm/truncated:1.0.0\n" + // too few fields
-		"=npm/no-advisory\n" + // no `:` at all
+		"~npm/truncated|1.0.0\n" + // too few fields
+		"=npm/no-advisory\n" + // no `|` at all
 		"?npm/unknown-shape\n" + // a marker this build does not know
-		"=npm/pinned@1.0.0:MAL-1\n"
+		"=npm/pinned@1.0.0|MAL-1\n"
 	sc, err := parseSupplyChainDoc(doc, 7)
 	if err != nil {
 		t.Fatalf("a document with junk lines must still parse: %v", err)
@@ -88,7 +88,7 @@ func TestAHeaderFieldThisBuildDoesNotKnowIsIgnored(t *testing.T) {
 }
 
 func TestModesDecideWhatAMatchDoes(t *testing.T) {
-	base := "# deter-supply-chain v1\n# %s\n=npm/pkg@1.0.0:MAL-9\n"
+	base := "# deter-supply-chain v1\n# %s\n=npm/pkg@1.0.0|MAL-9\n"
 	cases := []struct {
 		header      string
 		hit, blocks bool
@@ -113,7 +113,7 @@ func TestTheTailAndThePinnedPairsSwitchSeparately(t *testing.T) {
 	// ~208k typosquat entries are the only place a false positive could plausibly live, so an
 	// organization measuring them must still be able to block the ~25k compromised releases, which
 	// are the dangerous half.
-	doc := "# deter-supply-chain v1\n# malware=enforce tail=off\n!npm/typo\n=npm/real@1.0.0:MAL-1\n"
+	doc := "# deter-supply-chain v1\n# malware=enforce tail=off\n!npm/typo\n=npm/real@1.0.0|MAL-1\n"
 	sc, err := parseSupplyChainDoc(doc, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestTheTailAndThePinnedPairsSwitchSeparately(t *testing.T) {
 }
 
 func TestBlockUnfixedIsOptIn(t *testing.T) {
-	line := "~npm/abandoned:1.0.0:::C:GHSA-X:nofix\n"
+	line := "~npm/abandoned|1.0.0|||C|GHSA-X|nofix\n"
 	off, _ := parseSupplyChainDoc("# deter-supply-chain v1\n# unfixed=report\n"+line, 1)
 	on, _ := parseSupplyChainDoc("# deter-supply-chain v1\n# unfixed=block\n"+line, 1)
 
@@ -145,8 +145,8 @@ func TestABlockingHitBeatsAnUnfixedNote(t *testing.T) {
 	// Two advisories on one package, one of them unfixed. The developer must be told the most
 	// alarming TRUE thing, not whichever line the compiler happened to sort first.
 	doc := "# deter-supply-chain v1\n" +
-		"~npm/pkg:1.0.0:::C:GHSA-NOFIX:nofix\n" +
-		"~npm/pkg:1.0.0:1.5.0::H:GHSA-REAL:fix=1.5.0\n"
+		"~npm/pkg|1.0.0|||C|GHSA-NOFIX|nofix\n" +
+		"~npm/pkg|1.0.0|1.5.0||H|GHSA-REAL|fix=1.5.0\n"
 	sc, _ := parseSupplyChainDoc(doc, 1)
 	hit, ok := sc.decide(ParsedPackage{"npm", "pkg", "1.2.0"})
 	if !ok || !hit.Block || hit.Advisory != "GHSA-REAL" {
@@ -157,7 +157,7 @@ func TestABlockingHitBeatsAnUnfixedNote(t *testing.T) {
 func TestKevIsReportedAsKevNotAsAThresholdHit(t *testing.T) {
 	// "Blocked because it is being exploited right now" and "blocked because your organization set a
 	// number" are different sentences, and the first is the one that gets a developer to act.
-	doc := "# deter-supply-chain v1\n# cve=low\n~npm/pkg:1.0.0:2.0.0::L:GHSA-K:kev,fix=2.0.0\n"
+	doc := "# deter-supply-chain v1\n# cve=low\n~npm/pkg|1.0.0|2.0.0||L|GHSA-K|kev,fix=2.0.0\n"
 	sc, _ := parseSupplyChainDoc(doc, 1)
 	hit, _ := sc.decide(ParsedPackage{"npm", "pkg", "1.1.0"})
 	if hit.Reason != "kev" {
@@ -166,7 +166,7 @@ func TestKevIsReportedAsKevNotAsAThresholdHit(t *testing.T) {
 }
 
 func TestKevOverrideCanBeTurnedOff(t *testing.T) {
-	doc := "# deter-supply-chain v1\n# cve=critical kev=off\n~npm/pkg:1.0.0:2.0.0::M:GHSA-K:kev,fix=2.0.0\n"
+	doc := "# deter-supply-chain v1\n# cve=critical kev=off\n~npm/pkg|1.0.0|2.0.0||M|GHSA-K|kev,fix=2.0.0\n"
 	sc, _ := parseSupplyChainDoc(doc, 1)
 	if hit, ok := sc.decide(ParsedPackage{"npm", "pkg", "1.1.0"}); ok {
 		t.Errorf("a moderate under a critical threshold with kev=off must not match: %+v", hit)
@@ -174,7 +174,7 @@ func TestKevOverrideCanBeTurnedOff(t *testing.T) {
 }
 
 func TestEpssOverride(t *testing.T) {
-	line := "~npm/pkg:1.0.0:2.0.0::L:GHSA-E:fix=2.0.0,epss=0.900\n"
+	line := "~npm/pkg|1.0.0|2.0.0||L|GHSA-E|fix=2.0.0,epss=0.900\n"
 	on, _ := parseSupplyChainDoc("# deter-supply-chain v1\n# cve=critical epss=0.5\n"+line, 1)
 	off, _ := parseSupplyChainDoc("# deter-supply-chain v1\n# cve=critical\n"+line, 1)
 	if hit, ok := on.decide(ParsedPackage{"npm", "pkg", "1.1.0"}); !ok || hit.Reason != "epss" {
@@ -220,7 +220,7 @@ func TestAVersionNobodyCanReadIsLetThrough(t *testing.T) {
 	// The deliberate direction to fail. A false block on a package the organization actually depends
 	// on is the failure that gets the whole feature switched off, so an unreadable version is not
 	// blocked on a guess. Malware matching is exact-string and unaffected.
-	doc := "# deter-supply-chain v1\n~npm/pkg:0:::H:GHSA-X:fix=9\n!npm/evil\n"
+	doc := "# deter-supply-chain v1\n~npm/pkg|0|||H|GHSA-X|fix=9\n!npm/evil\n"
 	sc, _ := parseSupplyChainDoc(doc, 1)
 	if _, ok := sc.decide(ParsedPackage{"npm", "pkg", "not-a-version"}); ok {
 		t.Error("an unparseable version matched a range")
@@ -382,8 +382,8 @@ func startSupplyProxy(t *testing.T, doc string, mode Mode) (*http.Client, *proxy
 
 const proxyTestDoc = "# deter-supply-chain v1\n" +
 	"# generated=2126-01-01T00:00:00Z malware=enforce tail=enforce cve=high action=enforce kev=on\n" +
-	"=npm/left-pad@1.3.0:MAL-2025-1\n" +
-	"~npm/vite:6.2.0:6.2.4::M:GHSA-4r4m-qw57-chr8:kev,fix=6.2.4\n"
+	"=npm/left-pad@1.3.0|MAL-2025-1\n" +
+	"~npm/vite|6.2.0|6.2.4||M|GHSA-4r4m-qw57-chr8|kev,fix=6.2.4\n"
 
 func TestABlockedPackageNeverReachesTheRegistry(t *testing.T) {
 	client, _, origin, stop := startSupplyProxy(t, proxyTestDoc, ModeEnforce)
